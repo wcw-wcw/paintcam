@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from pathlib import Path
 
 from .gestures import (
     Color,
@@ -24,6 +25,13 @@ from .gestures import (
     palette_index,
     palette_top,
     calculate_zoom as tuned_calculate_zoom,
+)
+from .hand_tracking import (
+    DEFAULT_HAND_MODEL_PATH,
+    HAND_CONNECTIONS,
+    MediaPipeHandTracker,
+    model_missing_error,
+    resolve_hand_model_path,
 )
 
 cv2: Any = None
@@ -51,6 +59,11 @@ def load_dependencies() -> dict[str, bool]:
             status[name] = True
         except (ImportError, OSError):
             status[name] = False
+    status["mediapipe_tasks"] = bool(
+        status["mediapipe"]
+        and getattr(mp, "tasks", None)
+        and getattr(getattr(mp.tasks, "vision", None), "HandLandmarker", None)
+    )
     emit("dependency_status", dependencies=status)
     return status
 
@@ -66,6 +79,8 @@ class EngineConfig:
     draw_landmarks: bool = False
     debug_overlay: bool = False
     gesture_config_path: str | None = None
+    hand_model_path: Path = DEFAULT_HAND_MODEL_PATH
+    doctor: bool = False
     tuning: GestureTuning = field(default_factory=GestureTuning)
     palette: list[Color] = field(
         default_factory=lambda: [
@@ -80,28 +95,6 @@ class EngineConfig:
     )
 
 
-class MediaPipeHandTracker:
-    def __init__(self) -> None:
-        self._hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.65,
-            min_tracking_confidence=0.5,
-        )
-
-    def detect(self, frame: Any) -> list[Hand]:
-        result = self._hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        if not result.multi_hand_landmarks:
-            return []
-        return [
-            Hand([(point.x, point.y) for point in hand.landmark])
-            for hand in result.multi_hand_landmarks
-        ]
-
-    def close(self) -> None:
-        self._hands.close()
-
-
 class PaintCamEngine:
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
@@ -109,7 +102,7 @@ class PaintCamEngine:
         self.drawing = DrawingState(config.tuning.brush_size)
         self.zoom = ZoomState(1.0)
         self.canvas: Any = None
-        self.tracker = MediaPipeHandTracker()
+        self.tracker = MediaPipeHandTracker(mp, config.hand_model_path)
         self.registry = default_registry(config.tuning)
 
     def apply_gesture(self, result: GestureResult) -> None:
@@ -188,8 +181,11 @@ class PaintCamEngine:
                         cv2.flip(frame, 1), self.config.width, self.config.height
                     )
                     frame = apply_zoom(frame, self.zoom.value)
-                    hands = self.tracker.detect(frame)
                     now = time.monotonic()
+                    timestamp_ms = int(now * 1000)
+                    hands = self.tracker.detect(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), timestamp_ms
+                    )
                     context = GestureContext(
                         width=frame.shape[1],
                         height=frame.shape[0],
@@ -198,7 +194,7 @@ class PaintCamEngine:
                         drawing=self.drawing,
                         zoom=self.zoom,
                         tuning=self.config.tuning,
-                        timestamp_ms=int(now * 1000),
+                        timestamp_ms=timestamp_ms,
                         frame_index=frame_index,
                     )
                     result, all_results = self.registry.process(context)
@@ -426,15 +422,10 @@ def draw_debug_overlay(
 
 
 def draw_hand_landmarks(frame: Any, hands: list[Hand]) -> None:
-    connections = (
-        (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-        (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15),
-        (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
-    )
     height, width = frame.shape[:2]
     for hand in hands:
         points = [hand.point(index, width, height) for index in range(len(hand.landmarks))]
-        for first, second in connections:
+        for first, second in HAND_CONNECTIONS:
             cv2.line(
                 frame, points[first], points[second], (80, 220, 120), 2, cv2.LINE_AA
             )
@@ -498,6 +489,8 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
     parser.add_argument("--debug-overlay", action="store_true")
     parser.add_argument("--brush-size", type=int)
     parser.add_argument("--gesture-config")
+    parser.add_argument("--hand-model")
+    parser.add_argument("--doctor", action="store_true")
     args = parser.parse_args(argv)
     tuning = (
         GestureTuning.from_json(args.gesture_config)
@@ -517,7 +510,26 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
         draw_landmarks=args.draw_landmarks,
         debug_overlay=args.debug_overlay,
         gesture_config_path=args.gesture_config,
+        hand_model_path=resolve_hand_model_path(args.hand_model),
+        doctor=args.doctor,
         tuning=tuning,
+    )
+
+
+def emit_doctor(dependencies: dict[str, bool]) -> None:
+    emit(
+        "doctor",
+        python_version=sys.version.split()[0],
+        opencv_version=getattr(cv2, "__version__", None),
+        numpy_version=getattr(np, "__version__", None),
+        mediapipe_version=getattr(mp, "__version__", None),
+        mediapipe_path=getattr(mp, "__file__", None),
+        mediapipe_importable=dependencies["mediapipe"],
+        hand_landmarker_available=dependencies["mediapipe_tasks"],
+        default_model_path=str(DEFAULT_HAND_MODEL_PATH),
+        default_model_exists=DEFAULT_HAND_MODEL_PATH.is_file(),
+        pyvirtualcam_available=dependencies["pyvirtualcam"],
+        pyvirtualcam_version=getattr(pyvirtualcam, "__version__", None),
     )
 
 
@@ -531,6 +543,9 @@ def main() -> int:
         emit("engine_stopped", reason="configuration_error")
         return 2
     dependencies = load_dependencies()
+    if config.doctor:
+        emit_doctor(dependencies)
+        return 0
     required = [
         name for name in ("opencv", "numpy", "mediapipe") if not dependencies[name]
     ]
@@ -543,6 +558,21 @@ def main() -> int:
         emit("error", code="missing_dependencies", message=message, last_error=message)
         print(message, file=sys.stderr)
         emit("engine_stopped", reason="dependency_error")
+        return 2
+    if not dependencies["mediapipe_tasks"]:
+        message = (
+            "MediaPipe imported, but MediaPipe Tasks vision.HandLandmarker is unavailable. "
+            "Install the current requirements and verify with --doctor."
+        )
+        emit("error", code="hand_landmarker_api_unavailable", message=message, last_error=message)
+        print(message, file=sys.stderr)
+        emit("engine_stopped", reason="dependency_error")
+        return 2
+    if not config.hand_model_path.is_file():
+        error = model_missing_error(config.hand_model_path)
+        emit("error", **error)
+        print(error["message"], file=sys.stderr)
+        emit("engine_stopped", reason="model_error")
         return 2
     if config.virtual_camera and not dependencies["pyvirtualcam"]:
         message = (
@@ -569,6 +599,7 @@ def main() -> int:
         draw_landmarks=config.draw_landmarks,
         debug_overlay=config.debug_overlay,
         gesture_config=config.gesture_config_path,
+        hand_model=str(config.hand_model_path),
         gesture_tuning=config.tuning.to_dict(),
     )
     try:

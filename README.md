@@ -8,8 +8,8 @@ writes the processed feed through pyvirtualcam.
 
 - Tauri 2 / TypeScript / Vite: controls and engine status
 - Rust: Python process lifecycle and JSONL event bridge
-- Python / OpenCV / MediaPipe: mirrored capture, hand tracking, drawing, zoom,
-  preview, and optional landmark overlay
+- Python / OpenCV / MediaPipe Tasks Hand Landmarker: mirrored capture, hand
+  tracking, drawing, zoom, preview, and optional landmark overlay
 - pyvirtualcam: optional virtual camera output
 
 Current gestures:
@@ -34,14 +34,48 @@ source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
-OpenCV, NumPy, and MediaPipe are required. Startup prints a structured
-`dependency_status` JSONL event and exits cleanly if one is unavailable.
+OpenCV, NumPy, and the current MediaPipe Tasks API are required. PaintCam uses
+`vision.HandLandmarker` in synchronous video mode; it does not use the legacy
+`mp.solutions` API. Startup prints a structured `dependency_status` JSONL event
+and exits cleanly if an import or the required Hand Landmarker API is unavailable.
 pyvirtualcam is only required when virtual camera output is requested.
 
 On macOS, pyvirtualcam also needs a backend such as OBS Virtual Camera. If the
 package exists but no backend is available, PaintCam reports the problem and
 continues with preview-only output. Use `--no-virtual-camera` to disable it
 explicitly.
+
+## Hand Landmarker model
+
+MediaPipe Tasks requires a separate `.task` model bundle. Download Google's
+Hand Landmarker model into the default location:
+
+```sh
+python3 scripts/download-mediapipe-models.py
+ls -lh engine/models/hand_landmarker.task
+```
+
+The downloaded model is intentionally ignored by Git and source archives. To
+use a model stored elsewhere:
+
+```sh
+python3 engine/paintcam_engine.py \
+  --hand-model /path/to/hand_landmarker.task \
+  --no-virtual-camera
+```
+
+If the model is absent, startup emits an `error` JSONL event with code
+`hand_landmarker_model_missing` and the resolved expected path.
+
+Check the environment and default model without opening a camera:
+
+```sh
+python3 engine/paintcam_engine.py --doctor
+```
+
+The doctor event reports Python, OpenCV, NumPy, and MediaPipe versions; the
+MediaPipe install path; Tasks HandLandmarker availability; default model path
+and existence; and pyvirtualcam availability.
 
 ## Run the engine directly
 
@@ -61,6 +95,7 @@ Other useful options:
 
 ```sh
 python3 engine/paintcam_engine.py --camera-index 1 --no-virtual-camera
+python3 engine/paintcam_engine.py --hand-model ./models/custom.task --no-virtual-camera
 python3 engine/paintcam_engine.py --draw-landmarks --no-virtual-camera
 python3 engine/paintcam_engine.py --debug-overlay --no-virtual-camera
 python3 engine/paintcam_engine.py --draw-landmarks --debug-overlay --no-virtual-camera
@@ -127,6 +162,17 @@ npm run build
 cd src-tauri && cargo check
 python3 -m compileall engine
 ```
+
+### Common startup errors
+
+- Missing `.task` model: run `python3 scripts/download-mediapipe-models.py`, or
+  pass its location with `--hand-model`.
+- Camera permission denied: allow camera access for Terminal (or the packaged
+  host application) in the operating system's privacy settings, then restart it.
+- Camera index unavailable: close other camera users and try
+  `--camera-index 1` (then 2, if needed).
+- Virtual camera unavailable: install/start an OS backend such as OBS Virtual
+  Camera, or test with `--no-virtual-camera`.
 
 ### Suggested local camera checklist
 

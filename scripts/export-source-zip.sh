@@ -14,6 +14,7 @@ rm -f "$output"
 zip -r "$output" . \
   -x '.git/*' 'node_modules/*' 'dist/*' 'build/*' 'src-tauri/target/*' \
      '.venv/*' '*/.venv/*' '__pycache__/*' '*/__pycache__/*' \
+     'engine/models/*.task' \
      '__MACOSX/*' '*/__MACOSX/*' '.DS_Store' '*/.DS_Store' \
      "$(basename "$output")"
 printf 'Created %s\n' "$output"

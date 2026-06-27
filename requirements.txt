@@ -1,4 +1,4 @@
 opencv-python>=4.10
-mediapipe>=0.10
-numpy>=2.0
+mediapipe>=0.10.30
+numpy>=1.26
 pyvirtualcam>=0.12

@@ -67,6 +67,8 @@ class GestureTuning:
 @dataclass
 class Hand:
     landmarks: list[tuple[float, float]]
+    handedness: str | None = None
+    handedness_score: float | None = None
 
     def point(self, index: int, width: int, height: int) -> Point:
         x, y = self.landmarks[index]
