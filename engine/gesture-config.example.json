@@ -1,0 +1,13 @@
+{
+  "pinch_distance_threshold": 0.055,
+  "pinch_release_threshold": 0.075,
+  "pinch_debounce_ms": 100,
+  "palette_height_ratio": 0.128,
+  "palette_cooldown_ms": 150,
+  "draw_cooldown_ms": 100,
+  "zoom_cooldown_ms": 150,
+  "zoom_sensitivity": 1.0,
+  "min_zoom": 1.0,
+  "max_zoom": 2.8,
+  "brush_size": 16
+}

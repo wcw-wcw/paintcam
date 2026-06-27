@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
+    "test:python": "PYTHONPATH=engine python3 -m unittest discover -s engine/tests -v",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },
