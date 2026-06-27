@@ -107,6 +107,10 @@ npm install
 npm run tauri:dev
 ```
 
+`npm run tauri:dev` performs a fresh frontend build before every development
+launch. Tauri then lets Cargo rebuild any changed Rust code and starts the Vite
+development server, so no separate manual build step is needed.
+
 The control panel sets camera index, preview, virtual camera, landmark overlay,
 debug overlay, and brush size. It displays the active gesture and confidence
 alongside process, camera, color, zoom, virtual-camera, conflict, error, and
