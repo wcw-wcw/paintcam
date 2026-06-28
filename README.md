@@ -26,7 +26,7 @@ has priority over zoom, and two-hand zoom has priority over drawing.
 
 ## Python dependencies
 
-Use a virtual environment when possible:
+Create the repo-local virtual environment:
 
 ```sh
 python3 -m venv .venv
@@ -73,7 +73,8 @@ Check the environment and default model without opening a camera:
 python3 engine/paintcam_engine.py --doctor
 ```
 
-The doctor event reports Python, OpenCV, NumPy, and MediaPipe versions; the
+The Tauri control panel also has a **Run doctor** button. The doctor event
+reports the resolved Python executable, Python, OpenCV, NumPy, and MediaPipe versions; the
 MediaPipe install path; Tasks HandLandmarker availability; default model path
 and existence; and pyvirtualcam availability.
 
@@ -104,7 +105,12 @@ python3 engine/paintcam_engine.py \
   --gesture-config engine/gesture-config.example.json \
   --debug-overlay --no-virtual-camera
 python3 engine/paintcam_engine.py --help
+python3 engine/paintcam_engine.py --list-cameras
 ```
+
+`--list-cameras` probes indexes 0–4 and reports which devices open and return a
+frame. It needs OpenCV, but does not import/use HandLandmarker and does not
+require the `.task` model. The same probe is available in the Tauri UI.
 
 The debug overlay shows the winning gesture, confidence, selected color, brush
 size, zoom, hand count, virtual-camera state, and any cooldown/conflict state.
@@ -146,7 +152,17 @@ npm run tauri:dev
 launch. Tauri then lets Cargo rebuild any changed Rust code and starts the Vite
 development server, so no separate manual build step is needed.
 
-The control panel sets camera index, preview, virtual camera, landmark overlay,
+You do not need to activate `.venv` before launching Tauri. The Rust bridge
+resolves Python in this order:
+
+1. The optional Python executable entered in the control panel.
+2. Repo-local `.venv/bin/python`, when present.
+3. `python3` found on the shell `PATH` inherited by Tauri.
+4. A conventional system Python fallback, only if necessary.
+
+The resolved executable is displayed in engine state and doctor output. An
+explicit override is saved locally by the frontend; leave it blank for
+automatic resolution. The control panel sets camera index, preview, virtual camera, landmark overlay,
 debug overlay, and brush size. It displays the active gesture and confidence
 alongside process, camera, color, zoom, virtual-camera, conflict, error, and
 recent JSONL/log state. Python is launched from the working source tree; full
@@ -161,16 +177,25 @@ npm run test:python
 npm run build
 cd src-tauri && cargo check
 python3 -m compileall engine
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 ### Common startup errors
 
-- Missing `.task` model: run `python3 scripts/download-mediapipe-models.py`, or
+- Wrong Python executable: inspect **Python executable** in engine state or run
+  doctor. Clear the UI override to restore automatic resolution, or enter the
+  desired interpreter path explicitly.
+- MediaPipe missing from system Python: create/install the repo-local `.venv`;
+  the bridge will prefer it automatically. Doctor identifies the interpreter
+  and reports whether MediaPipe and HandLandmarker are available.
+- Missing `.task` model: the model is intentionally not committed. Run
+  `python3 scripts/download-mediapipe-models.py`, or
   pass its location with `--hand-model`.
-- Camera permission denied: allow camera access for Terminal (or the packaged
-  host application) in the operating system's privacy settings, then restart it.
-- Camera index unavailable: close other camera users and try
-  `--camera-index 1` (then 2, if needed).
+- Camera permission does not prompt: run the UI camera probe or direct
+  `--list-cameras`, then allow camera access for Terminal/the Tauri development
+  host in the operating system privacy settings and restart the app.
+- Camera index unavailable: close other camera users, use **Probe cameras
+  0–4**, and select an index reported as open/readable.
 - Virtual camera unavailable: install/start an OS backend such as OBS Virtual
   Camera, or test with `--no-virtual-camera`.
 
@@ -217,8 +242,8 @@ camera-free makes conflict and timing behavior unit-testable.
 ## Known limitations
 
 - Python and its dependencies must currently be installed separately.
-- The Rust bridge starts `python3`; interpreter/environment selection is not yet
-  configurable.
+- Python is resolved at development runtime; packaged sidecar handling is
+  intentionally deferred.
 - Virtual camera availability depends on an OS-specific backend.
 - Confidence is currently geometric confidence derived from normalized
   landmarks, not a trained per-gesture probability.

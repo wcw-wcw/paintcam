@@ -1,8 +1,11 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    env,
+    ffi::OsStr,
+    fs,
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -16,6 +19,7 @@ const MAX_LOG_LINES: usize = 100;
 struct EngineStatus {
     running: bool,
     pid: Option<u32>,
+    resolved_python: Option<String>,
     camera_index: Option<i64>,
     hands_detected: usize,
     active_gesture: String,
@@ -41,6 +45,71 @@ fn project_root() -> Result<PathBuf, String> {
         .parent()
         .map(PathBuf::from)
         .ok_or_else(|| "Could not resolve project root".to_string())
+}
+
+fn usable_python(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn find_on_path(program: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+    env::split_paths(path?)
+        .map(|directory| directory.join(program))
+        .find(|candidate| usable_python(candidate))
+}
+
+fn resolve_python_from(
+    explicit: Option<&str>,
+    root: &Path,
+    path: Option<&OsStr>,
+    fallbacks: &[&Path],
+) -> Result<PathBuf, String> {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(value);
+        let resolved = if candidate.components().count() == 1 {
+            find_on_path(candidate.as_os_str(), path).unwrap_or(candidate)
+        } else {
+            candidate
+        };
+        if usable_python(&resolved) {
+            return Ok(resolved);
+        }
+        return Err(format!(
+            "Configured Python executable is not a usable file: {}",
+            resolved.display()
+        ));
+    }
+    let venv_python = root.join(".venv").join("bin").join("python");
+    if usable_python(&venv_python) {
+        return Ok(venv_python);
+    }
+    if let Some(python) = find_on_path(OsStr::new("python3"), path) {
+        return Ok(python);
+    }
+    if let Some(python) = fallbacks.iter().find(|candidate| usable_python(candidate)) {
+        return Ok((*python).to_path_buf());
+    }
+    Err(
+        "No usable Python interpreter found. Create .venv, put python3 on PATH, or configure an explicit Python path."
+            .to_string(),
+    )
+}
+
+fn resolve_python(explicit: Option<&str>) -> Result<PathBuf, String> {
+    let root = project_root()?;
+    let fallbacks = [
+        Path::new("/usr/bin/python3"),
+        Path::new("/usr/local/bin/python3"),
+    ];
+    resolve_python_from(explicit, &root, env::var_os("PATH").as_deref(), &fallbacks)
+}
+
+fn display_path(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn append_log(status: &mut EngineStatus, line: String) {
@@ -136,6 +205,7 @@ fn spawn_stderr_reader(stderr: std::process::ChildStderr, status: Arc<Mutex<Engi
 #[tauri::command]
 fn start_engine(
     state: State<EngineProcess>,
+    python_path: Option<String>,
     camera_index: i64,
     preview_enabled: bool,
     virtual_camera_enabled: bool,
@@ -155,8 +225,22 @@ fn start_engine(
     }
     *child_slot = None;
 
-    let script = project_root()?.join("engine").join("paintcam_engine.py");
-    let mut command = Command::new("python3");
+    let root = project_root()?;
+    let python = resolve_python(python_path.as_deref())?;
+    let model = root.join("engine/models/hand_landmarker.task");
+    if !model.is_file() {
+        let message = format!(
+            "Hand Landmarker model is missing at {}. Run: python3 scripts/download-mediapipe-models.py",
+            model.display()
+        );
+        let mut snapshot = state.status.lock().map_err(|_| "Status lock poisoned")?;
+        snapshot.resolved_python = Some(display_path(&python));
+        snapshot.last_error = Some(message.clone());
+        append_log(&mut snapshot, message.clone());
+        return Err(message);
+    }
+    let script = root.join("engine").join("paintcam_engine.py");
+    let mut command = Command::new(&python);
     command
         .arg(script)
         .arg("--camera-index")
@@ -194,6 +278,7 @@ fn start_engine(
         *snapshot = EngineStatus {
             running: true,
             pid: Some(pid),
+            resolved_python: Some(display_path(&python)),
             camera_index: Some(camera_index),
             active_gesture: "none".to_string(),
             selected_color: "#f67834".to_string(),
@@ -212,6 +297,60 @@ fn start_engine(
     spawn_stderr_reader(stderr, Arc::clone(&state.status));
     *child_slot = Some(child);
     Ok(())
+}
+
+#[tauri::command]
+fn resolve_python_path(python_path: Option<String>) -> Result<String, String> {
+    resolve_python(python_path.as_deref()).map(|path| display_path(&path))
+}
+
+#[tauri::command]
+fn run_engine_doctor(python_path: Option<String>) -> Result<Value, String> {
+    run_engine_utility(python_path.as_deref(), "--doctor")
+}
+
+#[tauri::command]
+fn list_cameras(python_path: Option<String>) -> Result<Value, String> {
+    run_engine_utility(python_path.as_deref(), "--list-cameras")
+}
+
+fn run_engine_utility(python_path: Option<&str>, argument: &str) -> Result<Value, String> {
+    let python = resolve_python(python_path)?;
+    let script = project_root()?.join("engine/paintcam_engine.py");
+    let output = Command::new(&python)
+        .arg(script)
+        .arg(argument)
+        .output()
+        .map_err(|error| {
+            format!(
+                "Failed to run {} with {}: {error}",
+                argument,
+                python.display()
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let event = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| {
+            value.get("event").and_then(Value::as_str)
+                == Some(if argument == "--doctor" {
+                    "doctor"
+                } else {
+                    "camera_probe"
+                })
+        });
+    event.ok_or_else(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        format!(
+            "{} failed using {} (exit {}). {}{}",
+            argument,
+            display_path(&python),
+            output.status,
+            stdout,
+            stderr
+        )
+    })
 }
 
 #[tauri::command]
@@ -264,8 +403,74 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             start_engine,
             stop_engine,
-            engine_status
+            engine_status,
+            resolve_python_path,
+            run_engine_doctor,
+            list_cameras
         ])
         .run(tauri::generate_context!())
         .expect("error while running PaintCam");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        File::create(path).unwrap();
+    }
+
+    #[test]
+    fn resolution_prefers_explicit_then_venv_then_path_then_fallback() {
+        let temp = env::temp_dir().join(format!("paintcam-python-test-{}", std::process::id()));
+        let root = temp.join("repo");
+        let explicit = temp.join("explicit-python");
+        let venv = root.join(".venv/bin/python");
+        let bin = temp.join("bin");
+        let path_python = bin.join("python3");
+        let fallback = temp.join("fallback-python");
+        for path in [&explicit, &venv, &path_python, &fallback] {
+            touch(path);
+        }
+        assert_eq!(
+            resolve_python_from(
+                explicit.to_str(),
+                &root,
+                Some(bin.as_os_str()),
+                &[&fallback]
+            )
+            .unwrap(),
+            explicit
+        );
+        assert_eq!(
+            resolve_python_from(None, &root, Some(bin.as_os_str()), &[&fallback]).unwrap(),
+            venv
+        );
+        fs::remove_file(&venv).unwrap();
+        assert_eq!(
+            resolve_python_from(None, &root, Some(bin.as_os_str()), &[&fallback]).unwrap(),
+            path_python
+        );
+        fs::remove_file(&path_python).unwrap();
+        assert_eq!(
+            resolve_python_from(None, &root, Some(bin.as_os_str()), &[&fallback]).unwrap(),
+            fallback
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn invalid_explicit_python_is_an_error_without_falling_through() {
+        let root = env::temp_dir();
+        assert!(resolve_python_from(
+            Some("/definitely/missing/paintcam-python"),
+            &root,
+            None,
+            &[]
+        )
+        .unwrap_err()
+        .contains("Configured Python"));
+    }
 }

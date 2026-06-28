@@ -28,7 +28,12 @@ input[type="number"] {
   min-height: 40px; width: 100%; border: 1px solid #a7adb6; border-radius: 6px;
   padding: 0 10px; background: #fff; color: #202124; font: inherit;
 }
+input[type="text"] {
+  min-height: 40px; width: 100%; border: 1px solid #a7adb6; border-radius: 6px;
+  padding: 0 10px; background: #fff; color: #202124; font: inherit;
+}
 input[type="checkbox"] { width: 17px; height: 17px; }
+.wide { grid-column: 1 / -1; }
 .actions { grid-column: 1 / -1; display: flex; gap: 10px; }
 button {
   min-height: 40px; border: 1px solid #a7adb6; border-radius: 6px; background: #fff;
@@ -46,7 +51,7 @@ dd { display: flex; align-items: center; gap: 7px; margin: 0; color: #202124; li
 .error { display: grid; gap: 6px; margin-top: 18px; border-left: 4px solid #b3261e; padding: 10px 12px; background: #fff0ee; color: #7e1c16; }
 .notice { display: grid; gap: 6px; margin-top: 18px; border-left: 4px solid #b26a00; padding: 10px 12px; background: #fff7e8; color: #704100; }
 .confidence { border-radius: 999px; padding: 2px 7px; background: #e8eef4; color: #36516b; font-size: 12px; font-weight: 750; }
-.logs-panel pre {
+.logs-panel pre, .diagnostics-panel pre {
   max-height: 230px; overflow: auto; margin: 0; border-radius: 6px; padding: 14px;
   background: #20252b; color: #dce4ec; white-space: pre-wrap; overflow-wrap: anywhere;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;

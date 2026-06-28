@@ -4,6 +4,7 @@ import "./styles.css";
 type EngineStatus = {
   running: boolean;
   pid: number | null;
+  resolvedPython: string | null;
   cameraIndex: number | null;
   handsDetected: number;
   activeGesture: string;
@@ -29,6 +30,7 @@ app.innerHTML = `
     </header>
 
     <section class="panel controls" aria-label="Engine controls">
+      <label class="wide">Python executable (optional)<input id="python-path" type="text" placeholder="Auto: .venv/bin/python, then PATH"></label>
       <label>Camera index<input id="camera-index" type="number" min="0" step="1" value="0"></label>
       <label class="check"><input id="preview" type="checkbox" checked> Preview enabled</label>
       <label class="check"><input id="virtual-camera" type="checkbox" checked> Virtual camera enabled</label>
@@ -38,6 +40,8 @@ app.innerHTML = `
       <div class="actions">
         <button id="start" class="primary" type="button">Start engine</button>
         <button id="stop" type="button">Stop</button>
+        <button id="doctor" type="button">Run doctor</button>
+        <button id="probe-cameras" type="button">Probe cameras 0–4</button>
       </div>
     </section>
 
@@ -45,6 +49,7 @@ app.innerHTML = `
       <h2>Engine state</h2>
       <dl class="metrics">
         <div><dt>Process</dt><dd id="pid">—</dd></div>
+        <div><dt>Python executable</dt><dd id="python">Resolving…</dd></div>
         <div><dt>Camera</dt><dd id="camera">—</dd></div>
         <div><dt>Hands detected</dt><dd id="hands">0</dd></div>
         <div class="gesture-metric"><dt>Active gesture</dt><dd><strong id="gesture">none</strong><span id="confidence" class="confidence">0%</span></dd></div>
@@ -56,6 +61,11 @@ app.innerHTML = `
       </dl>
       <div id="conflict-wrap" class="notice" hidden><strong>Gesture conflict/cooldown</strong><span id="conflicts"></span></div>
       <div id="error-wrap" class="error" hidden><strong>Last error</strong><span id="error"></span></div>
+    </section>
+
+    <section class="panel diagnostics-panel">
+      <h2>Hardware diagnostics</h2>
+      <pre id="diagnostics" aria-live="polite">Run doctor or probe cameras to inspect this machine.</pre>
     </section>
 
     <section class="panel logs-panel">
@@ -70,6 +80,14 @@ const byId = <T extends HTMLElement>(id: string) =>
 const startButton = byId<HTMLButtonElement>("start");
 const stopButton = byId<HTMLButtonElement>("stop");
 const statusBadge = byId<HTMLSpanElement>("status");
+const pythonInput = byId<HTMLInputElement>("python-path");
+if (pythonInput) pythonInput.value = localStorage.getItem("paintcam.pythonPath") ?? "";
+
+function configuredPython(): string | null {
+  const value = pythonInput?.value.trim() ?? "";
+  localStorage.setItem("paintcam.pythonPath", value);
+  return value || null;
+}
 
 function text(id: string, value: string) {
   const element = byId(id);
@@ -82,6 +100,7 @@ function setStatus(status: EngineStatus) {
     statusBadge.dataset.running = String(status.running);
   }
   text("pid", status.pid == null ? "—" : `#${status.pid}`);
+  if (status.resolvedPython) text("python", status.resolvedPython);
   text("camera", status.cameraIndex == null ? "—" : String(status.cameraIndex));
   text("hands", String(status.handsDetected));
   text("gesture", status.activeGesture || "none");
@@ -115,6 +134,7 @@ startButton?.addEventListener("click", async () => {
   try {
     await invoke("start_engine", {
       cameraIndex,
+      pythonPath: configuredPython(),
       previewEnabled: byId<HTMLInputElement>("preview")?.checked ?? true,
       virtualCameraEnabled: byId<HTMLInputElement>("virtual-camera")?.checked ?? true,
       drawLandmarks: byId<HTMLInputElement>("draw-landmarks")?.checked ?? false,
@@ -130,10 +150,37 @@ startButton?.addEventListener("click", async () => {
   }
 });
 
+async function runDiagnostic(command: "run_engine_doctor" | "list_cameras") {
+  const output = byId<HTMLPreElement>("diagnostics");
+  if (output) output.textContent = "Running…";
+  try {
+    const result = await invoke<Record<string, unknown>>(command, {
+      pythonPath: configuredPython(),
+    });
+    if (output) output.textContent = JSON.stringify(result, null, 2);
+    if (typeof result.python_executable === "string") {
+      text("python", result.python_executable);
+    }
+  } catch (error) {
+    if (output) output.textContent = String(error);
+  }
+}
+
+byId<HTMLButtonElement>("doctor")?.addEventListener("click", () => {
+  void runDiagnostic("run_engine_doctor");
+});
+
+byId<HTMLButtonElement>("probe-cameras")?.addEventListener("click", () => {
+  void runDiagnostic("list_cameras");
+});
+
 stopButton?.addEventListener("click", async () => {
   await invoke("stop_engine");
   await refreshStatus();
 });
 
+invoke<string>("resolve_python_path", { pythonPath: configuredPython() })
+  .then((path) => text("python", path))
+  .catch((error) => text("python", String(error)));
 refreshStatus().catch(console.error);
 window.setInterval(() => refreshStatus().catch(console.error), 1000);

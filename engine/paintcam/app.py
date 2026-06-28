@@ -81,6 +81,7 @@ class EngineConfig:
     gesture_config_path: str | None = None
     hand_model_path: Path = DEFAULT_HAND_MODEL_PATH
     doctor: bool = False
+    list_cameras: bool = False
     tuning: GestureTuning = field(default_factory=GestureTuning)
     palette: list[Color] = field(
         default_factory=lambda: [
@@ -491,6 +492,11 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
     parser.add_argument("--gesture-config")
     parser.add_argument("--hand-model")
     parser.add_argument("--doctor", action="store_true")
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="Probe camera indexes 0-4 without loading MediaPipe or the hand model.",
+    )
     args = parser.parse_args(argv)
     tuning = (
         GestureTuning.from_json(args.gesture_config)
@@ -512,6 +518,7 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
         gesture_config_path=args.gesture_config,
         hand_model_path=resolve_hand_model_path(args.hand_model),
         doctor=args.doctor,
+        list_cameras=args.list_cameras,
         tuning=tuning,
     )
 
@@ -519,6 +526,7 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
 def emit_doctor(dependencies: dict[str, bool]) -> None:
     emit(
         "doctor",
+        python_executable=sys.executable,
         python_version=sys.version.split()[0],
         opencv_version=getattr(cv2, "__version__", None),
         numpy_version=getattr(np, "__version__", None),
@@ -531,6 +539,38 @@ def emit_doctor(dependencies: dict[str, bool]) -> None:
         pyvirtualcam_available=dependencies["pyvirtualcam"],
         pyvirtualcam_version=getattr(pyvirtualcam, "__version__", None),
     )
+
+
+def probe_camera_indexes(video_capture: Any, indexes: range = range(5)) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for index in indexes:
+        capture = video_capture(index)
+        try:
+            opened = bool(capture.isOpened())
+            readable = False
+            if opened:
+                readable, _ = capture.read()
+            results.append({"index": index, "opened": opened, "readable": bool(readable)})
+        finally:
+            capture.release()
+    return results
+
+
+def emit_camera_probe(dependencies: dict[str, bool]) -> int:
+    if not dependencies["opencv"]:
+        message = "Camera probing requires OpenCV. Install it with the resolved Python interpreter."
+        emit("error", code="opencv_missing", message=message, last_error=message)
+        return 2
+    cameras = probe_camera_indexes(cv2.VideoCapture)
+    emit(
+        "camera_probe",
+        python_executable=sys.executable,
+        checked_indexes=list(range(5)),
+        cameras=cameras,
+        open_indexes=[item["index"] for item in cameras if item["opened"]],
+        readable_indexes=[item["index"] for item in cameras if item["readable"]],
+    )
+    return 0
 
 
 def main() -> int:
@@ -546,6 +586,8 @@ def main() -> int:
     if config.doctor:
         emit_doctor(dependencies)
         return 0
+    if config.list_cameras:
+        return emit_camera_probe(dependencies)
     required = [
         name for name in ("opencv", "numpy", "mediapipe") if not dependencies[name]
     ]

@@ -1,6 +1,13 @@
 import unittest
 
-from paintcam.app import Hand, calculate_zoom, clamp, normalized_distance, palette_index
+from paintcam.app import (
+    Hand,
+    calculate_zoom,
+    clamp,
+    normalized_distance,
+    palette_index,
+    probe_camera_indexes,
+)
 
 
 class HelperTests(unittest.TestCase):
@@ -21,6 +28,34 @@ class HelperTests(unittest.TestCase):
     def test_zoom_math_and_clamping(self):
         self.assertEqual(calculate_zoom(1.0, 0.5, 1.0, 1.0, 2.8), 2.0)
         self.assertEqual(calculate_zoom(2.0, 1.0, 2.0, 1.0, 2.8), 2.8)
+
+    def test_camera_probe_releases_captures_and_reports_readability(self):
+        captures = []
+
+        class FakeCapture:
+            def __init__(self, index):
+                self.index = index
+                self.released = False
+                captures.append(self)
+
+            def isOpened(self):
+                return self.index == 1
+
+            def read(self):
+                return self.index == 1, object()
+
+            def release(self):
+                self.released = True
+
+        self.assertEqual(
+            probe_camera_indexes(FakeCapture, range(3)),
+            [
+                {"index": 0, "opened": False, "readable": False},
+                {"index": 1, "opened": True, "readable": True},
+                {"index": 2, "opened": False, "readable": False},
+            ],
+        )
+        self.assertTrue(all(capture.released for capture in captures))
 
 
 if __name__ == "__main__":
