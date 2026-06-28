@@ -47,7 +47,7 @@ class GestureStateTests(unittest.TestCase):
         self.assertEqual(pinch_confidence(0.08, 0.055, 0.075), 0.0)
 
     def test_pinch_debounce_and_release_hysteresis(self):
-        pinch = PinchDebouncer(0.055, 0.075, 100)
+        pinch = PinchDebouncer(0.055, 0.075, 100, 3)
         self.assertFalse(pinch.update(0.04, 0)[0])
         self.assertFalse(pinch.update(0.04, 99)[0])
         self.assertTrue(pinch.update(0.04, 100)[0])
@@ -81,6 +81,16 @@ class GestureStateTests(unittest.TestCase):
         self.assertFalse(zoom.active)
         self.assertEqual(zoom.conflict, "palette_select")
 
+    def test_palette_requires_stable_hold_before_selection(self):
+        registry = default_registry(GestureTuning())
+        palette_hand = hand(index=(0.75, 0.95))
+        first, _ = registry.process(context([palette_hand], 0))
+        second, _ = registry.process(context([palette_hand], 50))
+        third, _ = registry.process(context([palette_hand], 100))
+        self.assertEqual(first.action, "none")
+        self.assertEqual(second.action, "none")
+        self.assertEqual(third.action, "select_color")
+
     def test_two_hand_zoom_blocks_drawing(self):
         registry = default_registry(GestureTuning())
         winner, _ = registry.process(
@@ -97,12 +107,14 @@ class GestureStateTests(unittest.TestCase):
         registry = default_registry(GestureTuning())
         pinching_hand = hand(index=(0.5, 0.4), thumb=(0.51, 0.4))
         first, _ = registry.process(context([pinching_hand], 0))
-        second, _ = registry.process(context([pinching_hand], 99))
+        second, _ = registry.process(context([pinching_hand], 50))
         third, _ = registry.process(context([pinching_hand], 100))
+        fourth, _ = registry.process(context([pinching_hand], 140))
         self.assertFalse(first.active)
         self.assertFalse(second.active)
-        self.assertEqual(third.gesture_name, "pinch_draw")
-        self.assertTrue(third.active)
+        self.assertFalse(third.active)
+        self.assertEqual(fourth.gesture_name, "pinch_draw")
+        self.assertTrue(fourth.active)
 
 
 if __name__ == "__main__":

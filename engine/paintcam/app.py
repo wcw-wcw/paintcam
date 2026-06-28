@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import queue
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -97,7 +99,11 @@ class EngineConfig:
 
 
 class PaintCamEngine:
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(
+        self,
+        config: EngineConfig,
+        command_queue: queue.SimpleQueue[dict[str, Any]] | None = None,
+    ) -> None:
         self.config = config
         self.palette = PaletteState(config.palette)
         self.drawing = DrawingState(config.tuning.brush_size)
@@ -105,22 +111,69 @@ class PaintCamEngine:
         self.canvas: Any = None
         self.tracker = MediaPipeHandTracker(mp, config.hand_model_path)
         self.registry = default_registry(config.tuning)
+        self.command_queue = command_queue or queue.SimpleQueue()
+        self.drawing_enabled = True
+        self.canvas_dirty = False
+
+    def process_commands(self) -> None:
+        while True:
+            try:
+                payload = self.command_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                command = validate_engine_command(payload)
+                self.apply_command(command)
+            except (TypeError, ValueError) as error:
+                emit("command_error", message=str(error), command=payload.get("command"))
+
+    def apply_command(self, command: dict[str, Any]) -> None:
+        name = command["command"]
+        if name == "clear_canvas":
+            if self.canvas is not None:
+                self.canvas.fill(0)
+            self.canvas_dirty = False
+            self.drawing.previous_point = None
+            self.drawing.drawing = False
+        elif name == "reset_zoom":
+            self.zoom.value = 1.0
+            self.registry.deactivate_all()
+        elif name == "set_drawing_enabled":
+            self.drawing_enabled = command["enabled"]
+            self.drawing.previous_point = None
+            self.drawing.drawing = False
+            self.registry.deactivate_all()
+        elif name == "set_brush_size":
+            self.drawing.brush_size = command["brush_size"]
+        emit(
+            "command_applied",
+            command=name,
+            drawing_enabled=self.drawing_enabled,
+            canvas_dirty=self.canvas_dirty,
+            brush_size=self.drawing.brush_size,
+            zoom=self.zoom.value,
+        )
 
     def apply_gesture(self, result: GestureResult) -> None:
         if not result.active:
             self.drawing.drawing = False
             self.drawing.previous_point = None
             return
+        if result.action != "draw":
+            self.drawing.drawing = False
+            self.drawing.previous_point = None
         if result.action == "select_color":
             self.palette.selected_index = int(result.data["palette_index"])
-            self.drawing.drawing = False
-            self.drawing.previous_point = None
         elif result.action == "set_zoom":
             self.zoom.value = float(result.data["zoom"])
-            self.drawing.drawing = False
-            self.drawing.previous_point = None
-        elif result.action == "draw":
+        elif result.action == "draw" and self.drawing_enabled:
             point = tuple(result.data["point"])
+            if (
+                self.drawing.previous_point is not None
+                and pixel_distance(self.drawing.previous_point, point)
+                < self.config.tuning.draw_deadzone_px
+            ):
+                return
             radius = max(1, self.drawing.brush_size // 2)
             if self.drawing.previous_point is None:
                 cv2.circle(
@@ -142,6 +195,7 @@ class PaintCamEngine:
                 )
             self.drawing.previous_point = point
             self.drawing.drawing = True
+            self.canvas_dirty = True
 
     def run(self) -> None:
         capture = cv2.VideoCapture(self.config.camera_index)
@@ -168,6 +222,9 @@ class PaintCamEngine:
         last_gesture_event = 0.0
         last_gesture_state: tuple[Any, ...] | None = None
         frame_index = 0
+        fps_window_started = time.monotonic()
+        fps_window_frames = 0
+        measured_fps = 0.0
         try:
             with virtual_camera_sink(self.config, frame) as virtual_camera:
                 virtual_active = virtual_camera is not None
@@ -178,11 +235,18 @@ class PaintCamEngine:
                             f"Camera index {self.config.camera_index} stopped returning frames."
                         )
                     frame_index += 1
+                    fps_window_frames += 1
+                    self.process_commands()
                     frame = resize_frame(
                         cv2.flip(frame, 1), self.config.width, self.config.height
                     )
                     frame = apply_zoom(frame, self.zoom.value)
                     now = time.monotonic()
+                    elapsed = now - fps_window_started
+                    if elapsed >= 1.0:
+                        measured_fps = fps_window_frames / elapsed
+                        fps_window_started = now
+                        fps_window_frames = 0
                     timestamp_ms = int(now * 1000)
                     hands = self.tracker.detect(
                         cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), timestamp_ms
@@ -213,6 +277,7 @@ class PaintCamEngine:
                         self.palette,
                         self.drawing,
                         self.zoom,
+                        self.drawing_enabled,
                     )
                     if self.config.draw_landmarks:
                         draw_hand_landmarks(output, hands)
@@ -226,6 +291,8 @@ class PaintCamEngine:
                             len(hands),
                             virtual_active,
                             conflicts,
+                            self.drawing_enabled,
+                            self.canvas_dirty,
                         )
                     if virtual_camera is not None:
                         virtual_camera.send(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
@@ -262,7 +329,10 @@ class PaintCamEngine:
                             width=output.shape[1],
                             height=output.shape[0],
                             fps=self.config.fps,
+                            measured_fps=round(measured_fps, 1),
                             frame_index=frame_index,
+                            camera_open=True,
+                            last_frame_time=time.time(),
                             hands_detected=len(hands),
                             active_gesture=result.gesture_name
                             if result.active
@@ -271,6 +341,8 @@ class PaintCamEngine:
                             selected_color=color_hex(self.palette.selected_color),
                             brush_size=self.drawing.brush_size,
                             zoom=round(self.zoom.value, 3),
+                            drawing_enabled=self.drawing_enabled,
+                            canvas_dirty=self.canvas_dirty,
                             preview_enabled=self.config.preview,
                             virtual_camera_enabled=virtual_active,
                         )
@@ -309,6 +381,45 @@ def emit_gesture_state(
     )
 
 
+def pixel_distance(first: tuple[int, int], second: tuple[int, int]) -> float:
+    return ((first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2) ** 0.5
+
+
+def validate_engine_command(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("command"), str):
+        raise ValueError("Engine command must be a JSON object with a command string.")
+    name = payload["command"]
+    if name in {"clear_canvas", "reset_zoom"}:
+        return {"command": name}
+    if name == "set_drawing_enabled":
+        if not isinstance(payload.get("enabled"), bool):
+            raise ValueError("set_drawing_enabled requires a boolean enabled value.")
+        return {"command": name, "enabled": payload["enabled"]}
+    if name == "set_brush_size":
+        value = payload.get("brush_size")
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
+            raise ValueError("set_brush_size requires an integer from 1 to 100.")
+        return {"command": name, "brush_size": value}
+    raise ValueError(f"Unknown engine command: {name}")
+
+
+def start_command_reader() -> queue.SimpleQueue[dict[str, Any]]:
+    commands: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
+
+    def read_commands() -> None:
+        for line in sys.stdin:
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise ValueError("command must be a JSON object")
+                commands.put(payload)
+            except (json.JSONDecodeError, ValueError) as error:
+                emit("command_error", message=f"Invalid stdin command: {error}")
+
+    threading.Thread(target=read_commands, daemon=True, name="paintcam-commands").start()
+    return commands
+
+
 @contextmanager
 def virtual_camera_sink(config: EngineConfig, frame: Any):
     if not config.virtual_camera:
@@ -344,10 +455,13 @@ def compose_output(
     palette: PaletteState,
     drawing: DrawingState,
     zoom: ZoomState,
+    drawing_enabled: bool,
 ) -> Any:
     output = cv2.addWeighted(frame, 1.0, canvas, 1.0, 0)
     draw_palette(output, config, palette)
-    draw_status(output, palette.selected_color, drawing.brush_size, zoom.value)
+    draw_status(
+        output, palette.selected_color, drawing.brush_size, zoom.value, drawing_enabled
+    )
     return output
 
 
@@ -366,17 +480,34 @@ def draw_palette(frame: Any, config: EngineConfig, palette: PaletteState) -> Non
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1)
         if index == palette.selected_index:
             cv2.rectangle(
+                frame, (x1 - 8, y1 - 8), (x2 + 8, y2 + 8), (16, 16, 16), 7
+            )
+            cv2.rectangle(
                 frame, (x1 - 5, y1 - 5), (x2 + 5, y2 + 5), (255, 255, 255), 3
+            )
+            cv2.putText(
+                frame,
+                "ACTIVE",
+                (x1, max(top + 16, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                lineType=cv2.LINE_AA,
             )
 
 
 def draw_status(
-    frame: Any, selected_color: Color, brush_size: int, zoom: float
+    frame: Any,
+    selected_color: Color,
+    brush_size: int,
+    zoom: float,
+    drawing_enabled: bool,
 ) -> None:
     cv2.circle(frame, (34, 34), max(5, brush_size // 2), selected_color, -1)
     cv2.putText(
         frame,
-        f"PaintCam  {zoom:.2f}x",
+        f"PaintCam  {zoom:.2f}x  {'DRAW' if drawing_enabled else 'PAUSED'}",
         (58, 43),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -395,12 +526,16 @@ def draw_debug_overlay(
     hands_detected: int,
     virtual_camera_active: bool,
     conflicts: list[str],
+    drawing_enabled: bool,
+    canvas_dirty: bool,
 ) -> None:
     lines = [
         f"Gesture: {result.gesture_name if result.active else 'none'}",
         f"Confidence: {result.confidence:.2f}",
         f"Color: {color_hex(palette.selected_color)}",
         f"Brush: {drawing.brush_size}px",
+        f"Drawing: {'enabled' if drawing_enabled else 'paused'}",
+        f"Canvas: {'dirty' if canvas_dirty else 'empty'}",
         f"Zoom: {zoom.value:.2f}x",
         f"Hands: {hands_detected}",
         f"Virtual camera: {'active' if virtual_camera_active else 'inactive'}",
@@ -645,7 +780,7 @@ def main() -> int:
         gesture_tuning=config.tuning.to_dict(),
     )
     try:
-        PaintCamEngine(config).run()
+        PaintCamEngine(config, start_command_reader()).run()
     except KeyboardInterrupt:
         emit("engine_stopped", reason="interrupted")
         return 0

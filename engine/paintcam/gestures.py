@@ -16,10 +16,14 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 @dataclass
 class GestureTuning:
-    pinch_distance_threshold: float = 0.055
+    pinch_distance_threshold: float = 0.05
     pinch_release_threshold: float = 0.075
-    pinch_debounce_ms: int = 100
+    pinch_debounce_ms: int = 140
+    pinch_min_stable_frames: int = 4
+    draw_deadzone_px: int = 3
     palette_height_ratio: float = 0.128
+    palette_hold_ms: int = 100
+    palette_min_stable_frames: int = 3
     palette_cooldown_ms: int = 150
     draw_cooldown_ms: int = 100
     zoom_cooldown_ms: int = 150
@@ -39,8 +43,13 @@ class GestureTuning:
             raise ValueError("zoom bounds are invalid")
         if self.brush_size < 1:
             raise ValueError("brush_size must be positive")
+        if self.pinch_min_stable_frames < 1 or self.palette_min_stable_frames < 1:
+            raise ValueError("stable frame counts must be positive")
+        if self.draw_deadzone_px < 0:
+            raise ValueError("draw_deadzone_px cannot be negative")
         if min(
             self.pinch_debounce_ms,
+            self.palette_hold_ms,
             self.palette_cooldown_ms,
             self.draw_cooldown_ms,
             self.zoom_cooldown_ms,
@@ -180,11 +189,19 @@ def pinch_confidence(distance: float, threshold: float, release_threshold: float
 
 
 class PinchDebouncer:
-    def __init__(self, threshold: float, release_threshold: float, debounce_ms: int) -> None:
+    def __init__(
+        self,
+        threshold: float,
+        release_threshold: float,
+        debounce_ms: int,
+        minimum_stable_frames: int = 1,
+    ) -> None:
         self.threshold = threshold
         self.release_threshold = release_threshold
         self.debounce_ms = debounce_ms
+        self.minimum_stable_frames = minimum_stable_frames
         self.candidate_since_ms: int | None = None
+        self.stable_frames = 0
         self.active = False
 
     def update(self, distance: float, timestamp_ms: int) -> tuple[bool, float]:
@@ -196,14 +213,20 @@ class PinchDebouncer:
         if distance <= self.threshold:
             if self.candidate_since_ms is None:
                 self.candidate_since_ms = timestamp_ms
-            if timestamp_ms - self.candidate_since_ms >= self.debounce_ms:
+            self.stable_frames += 1
+            if (
+                timestamp_ms - self.candidate_since_ms >= self.debounce_ms
+                and self.stable_frames >= self.minimum_stable_frames
+            ):
                 self.active = True
         else:
             self.candidate_since_ms = None
+            self.stable_frames = 0
         return self.active, confidence
 
     def reset(self) -> None:
         self.candidate_since_ms = None
+        self.stable_frames = 0
         self.active = False
 
 
@@ -215,6 +238,11 @@ class PaletteSelectGesture:
 
     def __init__(self, tuning: GestureTuning) -> None:
         self.cooldown_ms = tuning.palette_cooldown_ms
+        self.hold_ms = tuning.palette_hold_ms
+        self.minimum_stable_frames = tuning.palette_min_stable_frames
+        self.candidate_index: int | None = None
+        self.candidate_since_ms: int | None = None
+        self.stable_frames = 0
 
     def evaluate(self, context: GestureContext) -> GestureResult:
         if not context.hands:
@@ -227,7 +255,22 @@ class PaletteSelectGesture:
             len(context.palette.colors),
         )
         if index is None:
+            self.deactivate()
             return GestureResult(self.name, False, debug_text="index outside palette")
+        if index != self.candidate_index:
+            self.candidate_index = index
+            self.candidate_since_ms = context.timestamp_ms
+            self.stable_frames = 1
+        else:
+            self.stable_frames += 1
+        held_ms = context.timestamp_ms - (
+            self.candidate_since_ms
+            if self.candidate_since_ms is not None
+            else context.timestamp_ms
+        )
+        confirmed = (
+            held_ms >= self.hold_ms and self.stable_frames >= self.minimum_stable_frames
+        )
         point_y = context.hands[0].landmarks[8][1]
         top = 1.0 - context.tuning.palette_height_ratio
         confidence = clamp((point_y - top) / context.tuning.palette_height_ratio, 0.0, 1.0)
@@ -236,14 +279,16 @@ class PaletteSelectGesture:
             self.name,
             True,
             confidence,
-            "select_color",
-            f"palette swatch {index}",
+            "select_color" if confirmed else "none",
+            f"palette swatch {index} {'confirmed' if confirmed else 'holding'}",
             True,
-            data={"palette_index": index},
+            data={"palette_index": index, "confirmed": confirmed},
         )
 
     def deactivate(self) -> None:
-        return
+        self.candidate_index = None
+        self.candidate_since_ms = None
+        self.stable_frames = 0
 
 
 class TwoHandZoomGesture:
@@ -299,6 +344,7 @@ class PinchDrawGesture:
             tuning.pinch_distance_threshold,
             tuning.pinch_release_threshold,
             tuning.pinch_debounce_ms,
+            tuning.pinch_min_stable_frames,
         )
 
     def evaluate(self, context: GestureContext) -> GestureResult:
@@ -358,6 +404,11 @@ class GestureRegistry:
                 gesture.deactivate()
         self.previous_active = active_now
         return winner, results
+
+    def deactivate_all(self) -> None:
+        for gesture in self.gestures:
+            gesture.deactivate()
+        self.previous_active.clear()
 
 
 def resolve_gesture_results(

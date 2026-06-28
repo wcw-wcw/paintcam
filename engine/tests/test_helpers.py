@@ -6,7 +6,9 @@ from paintcam.app import (
     clamp,
     normalized_distance,
     palette_index,
+    pixel_distance,
     probe_camera_indexes,
+    validate_engine_command,
 )
 
 
@@ -56,6 +58,19 @@ class HelperTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(capture.released for capture in captures))
+
+    def test_command_validation_is_bounded(self):
+        self.assertEqual(
+            validate_engine_command({"command": "set_brush_size", "brush_size": 24}),
+            {"command": "set_brush_size", "brush_size": 24},
+        )
+        with self.assertRaises(ValueError):
+            validate_engine_command({"command": "set_brush_size", "brush_size": 101})
+        with self.assertRaises(ValueError):
+            validate_engine_command({"command": "unknown"})
+
+    def test_pixel_deadzone_distance(self):
+        self.assertEqual(pixel_distance((1, 1), (4, 5)), 5.0)
 
 
 if __name__ == "__main__":

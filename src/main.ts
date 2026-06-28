@@ -6,6 +6,10 @@ type EngineStatus = {
   pid: number | null;
   resolvedPython: string | null;
   cameraIndex: number | null;
+  cameraOpen: boolean;
+  measuredFps: number;
+  frameCount: number;
+  lastFrameTime: number | null;
   handsDetected: number;
   activeGesture: string;
   gestureConfidence: number;
@@ -14,6 +18,8 @@ type EngineStatus = {
   selectedColor: string;
   brushSize: number;
   zoom: number;
+  drawingEnabled: boolean;
+  canvasDirty: boolean;
   virtualCameraStatus: string;
   lastError: string | null;
   recentLogLines: string[];
@@ -46,17 +52,33 @@ app.innerHTML = `
     </section>
 
     <section class="panel">
+      <h2>Live canvas controls</h2>
+      <div class="actions">
+        <button id="clear-canvas" type="button">Clear canvas</button>
+        <button id="reset-zoom" type="button">Reset zoom</button>
+        <button id="toggle-drawing" type="button">Pause drawing</button>
+      </div>
+      <p class="hint">Brush size changes apply live while the engine is running. Gesture thresholds use the startup configuration.</p>
+    </section>
+
+    <section class="panel">
       <h2>Engine state</h2>
       <dl class="metrics">
         <div><dt>Process</dt><dd id="pid">—</dd></div>
         <div><dt>Python executable</dt><dd id="python">Resolving…</dd></div>
         <div><dt>Camera</dt><dd id="camera">—</dd></div>
+        <div><dt>Camera open</dt><dd id="camera-open">No</dd></div>
+        <div><dt>Measured FPS</dt><dd id="fps">0.0</dd></div>
+        <div><dt>Frame count</dt><dd id="frame-count">0</dd></div>
+        <div><dt>Last frame</dt><dd id="last-frame">—</dd></div>
         <div><dt>Hands detected</dt><dd id="hands">0</dd></div>
         <div class="gesture-metric"><dt>Active gesture</dt><dd><strong id="gesture">none</strong><span id="confidence" class="confidence">0%</span></dd></div>
         <div><dt>Gesture detail</dt><dd id="gesture-detail">—</dd></div>
         <div><dt>Selected color</dt><dd><i id="color-chip"></i><span id="color">—</span></dd></div>
         <div><dt>Brush size</dt><dd id="brush">16px</dd></div>
         <div><dt>Zoom</dt><dd id="zoom">1.00×</dd></div>
+        <div><dt>Drawing</dt><dd id="drawing-state">Enabled</dd></div>
+        <div><dt>Canvas</dt><dd id="canvas-state">Empty</dd></div>
         <div><dt>Virtual camera</dt><dd id="virtual-status">—</dd></div>
       </dl>
       <div id="conflict-wrap" class="notice" hidden><strong>Gesture conflict/cooldown</strong><span id="conflicts"></span></div>
@@ -80,6 +102,8 @@ const byId = <T extends HTMLElement>(id: string) =>
 const startButton = byId<HTMLButtonElement>("start");
 const stopButton = byId<HTMLButtonElement>("stop");
 const statusBadge = byId<HTMLSpanElement>("status");
+const liveControlIds = ["clear-canvas", "reset-zoom", "toggle-drawing"];
+let latestStatus: EngineStatus | null = null;
 const pythonInput = byId<HTMLInputElement>("python-path");
 if (pythonInput) pythonInput.value = localStorage.getItem("paintcam.pythonPath") ?? "";
 
@@ -95,6 +119,7 @@ function text(id: string, value: string) {
 }
 
 function setStatus(status: EngineStatus) {
+  latestStatus = status;
   if (statusBadge) {
     statusBadge.textContent = status.running ? "Running" : "Stopped";
     statusBadge.dataset.running = String(status.running);
@@ -102,6 +127,12 @@ function setStatus(status: EngineStatus) {
   text("pid", status.pid == null ? "—" : `#${status.pid}`);
   if (status.resolvedPython) text("python", status.resolvedPython);
   text("camera", status.cameraIndex == null ? "—" : String(status.cameraIndex));
+  text("camera-open", status.cameraOpen ? "Yes" : "No");
+  text("fps", status.measuredFps.toFixed(1));
+  text("frame-count", String(status.frameCount));
+  text("last-frame", status.lastFrameTime
+    ? new Date(status.lastFrameTime * 1000).toLocaleTimeString()
+    : "—");
   text("hands", String(status.handsDetected));
   text("gesture", status.activeGesture || "none");
   text("confidence", `${Math.round((status.gestureConfidence || 0) * 100)}%`);
@@ -109,6 +140,9 @@ function setStatus(status: EngineStatus) {
   text("color", status.selectedColor || "—");
   text("brush", `${status.brushSize || 16}px`);
   text("zoom", `${(status.zoom || 1).toFixed(2)}×`);
+  text("drawing-state", status.drawingEnabled ? "Enabled" : "Paused");
+  text("canvas-state", status.canvasDirty ? "Contains drawing" : "Empty");
+  text("toggle-drawing", status.drawingEnabled ? "Pause drawing" : "Resume drawing");
   text("virtual-status", status.virtualCameraStatus || "—");
   const chip = byId<HTMLElement>("color-chip");
   if (chip) chip.style.backgroundColor = status.selectedColor || "transparent";
@@ -123,6 +157,10 @@ function setStatus(status: EngineStatus) {
     : "No engine events yet.");
   if (startButton) startButton.disabled = status.running;
   if (stopButton) stopButton.disabled = !status.running;
+  for (const id of liveControlIds) {
+    const button = byId<HTMLButtonElement>(id);
+    if (button) button.disabled = !status.running;
+  }
 }
 
 async function refreshStatus() {
@@ -148,6 +186,41 @@ startButton?.addEventListener("click", async () => {
     const wrap = byId<HTMLElement>("error-wrap");
     if (wrap) wrap.hidden = false;
   }
+});
+
+async function sendEngineCommand(command: Record<string, unknown>) {
+  try {
+    await invoke("send_engine_command", { command });
+  } catch (error) {
+    text("error", String(error));
+    const wrap = byId<HTMLElement>("error-wrap");
+    if (wrap) wrap.hidden = false;
+  }
+}
+
+byId<HTMLButtonElement>("clear-canvas")?.addEventListener("click", () => {
+  void sendEngineCommand({ command: "clear_canvas" });
+});
+
+byId<HTMLButtonElement>("reset-zoom")?.addEventListener("click", () => {
+  void sendEngineCommand({ command: "reset_zoom" });
+});
+
+byId<HTMLButtonElement>("toggle-drawing")?.addEventListener("click", () => {
+  void sendEngineCommand({
+    command: "set_drawing_enabled",
+    enabled: !(latestStatus?.drawingEnabled ?? true),
+  });
+});
+
+let brushUpdateTimer: number | undefined;
+byId<HTMLInputElement>("brush-size")?.addEventListener("input", (event) => {
+  if (!latestStatus?.running) return;
+  window.clearTimeout(brushUpdateTimer);
+  const brushSize = Number((event.target as HTMLInputElement).value);
+  brushUpdateTimer = window.setTimeout(() => {
+    void sendEngineCommand({ command: "set_brush_size", brush_size: brushSize });
+  }, 150);
 });
 
 async function runDiagnostic(command: "run_engine_doctor" | "list_cameras") {

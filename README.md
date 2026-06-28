@@ -132,8 +132,13 @@ Available settings:
 
 - `pinch_distance_threshold` and `pinch_release_threshold`: normalized
   thumb/index activation and hysteresis distances
-- `pinch_debounce_ms`: time a pinch must remain stable before drawing
+- `pinch_debounce_ms` and `pinch_min_stable_frames`: time and consecutive
+  frames a pinch must remain stable before drawing
+- `draw_deadzone_px`: minimum fingertip movement before another stroke segment
+  is added
 - `palette_height_ratio`: bottom fraction of the frame reserved for the palette
+- `palette_hold_ms` and `palette_min_stable_frames`: confirmation required
+  before a hovered swatch becomes active
 - `palette_cooldown_ms`, `draw_cooldown_ms`, and `zoom_cooldown_ms`
 - `zoom_sensitivity`, `min_zoom`, and `max_zoom`
 - `brush_size`: output stroke width in pixels
@@ -167,6 +172,43 @@ debug overlay, and brush size. It displays the active gesture and confidence
 alongside process, camera, color, zoom, virtual-camera, conflict, error, and
 recent JSONL/log state. Python is launched from the working source tree; full
 sidecar packaging is intentionally not part of this milestone.
+
+While the engine is running, **Clear canvas**, **Reset zoom**, **Pause/Resume
+drawing**, and brush size changes are sent over a bounded JSONL stdin command
+channel. Preview and hand tracking continue while drawing is paused. Gesture
+threshold changes in a config file require an engine restart.
+
+## First successful camera test
+
+1. Download the hand model and run **Run doctor**; confirm OpenCV, MediaPipe,
+   HandLandmarker, and the model all report available.
+2. Run **Probe cameras 0–4** and select an index reported open and readable.
+3. Disable virtual camera initially, enable preview, landmarks, and debug
+   overlay, then start the engine.
+4. Confirm Camera open is **Yes**, FPS/frame count advance, and landmarks follow
+   one hand.
+5. Hold the index fingertip over a palette cell until its active outline moves.
+6. Pinch thumb/index above the palette and hold briefly; move steadily to draw.
+7. Pause drawing and verify preview/tracking continue without new strokes.
+8. Clear the canvas, reset zoom, then use two hands to verify zoom owns the
+   frame and blocks drawing.
+9. Enable virtual camera only after the preview path works.
+
+## Live tuning guidance
+
+- Drawing triggers too easily: lower `pinch_distance_threshold`, increase
+  `pinch_debounce_ms` or `pinch_min_stable_frames`, and restart.
+- Drawing does not trigger: raise `pinch_distance_threshold` slightly, verify
+  thumb/index landmarks are stable, or reduce debounce/stable frames.
+- Palette flickers: increase `palette_hold_ms` or
+  `palette_min_stable_frames`. Drawing is blocked immediately anywhere in the
+  palette region, even before selection confirms.
+- Zoom is too sensitive: lower `zoom_sensitivity`.
+- Landmarks lag: improve lighting, keep the hand fully visible, close other
+  camera consumers, and compare measured FPS with the requested FPS.
+- FPS is low: reduce `--width`, `--height`, or `--fps` when running directly;
+  disable landmarks/debug overlay and virtual camera while isolating the
+  bottleneck.
 
 ## Tests and validation
 

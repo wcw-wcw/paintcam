@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::OsStr,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -21,6 +21,10 @@ struct EngineStatus {
     pid: Option<u32>,
     resolved_python: Option<String>,
     camera_index: Option<i64>,
+    camera_open: bool,
+    measured_fps: f64,
+    frame_count: u64,
+    last_frame_time: Option<f64>,
     hands_detected: usize,
     active_gesture: String,
     gesture_confidence: f64,
@@ -29,6 +33,8 @@ struct EngineStatus {
     selected_color: String,
     brush_size: u64,
     zoom: f64,
+    drawing_enabled: bool,
+    canvas_dirty: bool,
     virtual_camera_status: String,
     last_error: Option<String>,
     recent_log_lines: Vec<String>,
@@ -128,6 +134,18 @@ fn update_from_event(status: &mut EngineStatus, value: &Value, raw: &str) {
     if let Some(count) = value.get("hands_detected").and_then(Value::as_u64) {
         status.hands_detected = count as usize;
     }
+    if let Some(open) = value.get("camera_open").and_then(Value::as_bool) {
+        status.camera_open = open;
+    }
+    if let Some(fps) = value.get("measured_fps").and_then(Value::as_f64) {
+        status.measured_fps = fps;
+    }
+    if let Some(frame) = value.get("frame_index").and_then(Value::as_u64) {
+        status.frame_count = frame;
+    }
+    if let Some(timestamp) = value.get("last_frame_time").and_then(Value::as_f64) {
+        status.last_frame_time = Some(timestamp);
+    }
     if let Some(gesture) = value.get("active_gesture").and_then(Value::as_str) {
         status.active_gesture = gesture.to_string();
     }
@@ -153,6 +171,12 @@ fn update_from_event(status: &mut EngineStatus, value: &Value, raw: &str) {
     if let Some(zoom) = value.get("zoom").and_then(Value::as_f64) {
         status.zoom = zoom;
     }
+    if let Some(enabled) = value.get("drawing_enabled").and_then(Value::as_bool) {
+        status.drawing_enabled = enabled;
+    }
+    if let Some(dirty) = value.get("canvas_dirty").and_then(Value::as_bool) {
+        status.canvas_dirty = dirty;
+    }
     if let Some(error) = value
         .get("last_error")
         .or_else(|| value.get("message"))
@@ -169,6 +193,7 @@ fn update_from_event(status: &mut EngineStatus, value: &Value, raw: &str) {
         Some("engine_stopped") => {
             status.running = false;
             status.pid = None;
+            status.camera_open = false;
         }
         Some("virtual_camera_status") => {
             if let Some(value) = value.get("status").and_then(Value::as_str) {
@@ -245,6 +270,7 @@ fn start_engine(
         .arg(script)
         .arg("--camera-index")
         .arg(camera_index.to_string())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !preview_enabled {
@@ -284,6 +310,7 @@ fn start_engine(
             selected_color: "#f67834".to_string(),
             brush_size,
             zoom: 1.0,
+            drawing_enabled: true,
             virtual_camera_status: if virtual_camera_enabled {
                 "starting"
             } else {
@@ -297,6 +324,50 @@ fn start_engine(
     spawn_stderr_reader(stderr, Arc::clone(&state.status));
     *child_slot = Some(child);
     Ok(())
+}
+
+fn validate_command(value: &Value) -> Result<(), String> {
+    let name = value
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or("Engine command requires a command string")?;
+    match name {
+        "clear_canvas" | "reset_zoom" => Ok(()),
+        "set_drawing_enabled" if value.get("enabled").and_then(Value::as_bool).is_some() => Ok(()),
+        "set_brush_size"
+            if value
+                .get("brush_size")
+                .and_then(Value::as_u64)
+                .is_some_and(|size| (1..=100).contains(&size)) =>
+        {
+            Ok(())
+        }
+        "set_drawing_enabled" => Err("set_drawing_enabled requires boolean enabled".to_string()),
+        "set_brush_size" => Err("set_brush_size requires an integer from 1 to 100".to_string()),
+        _ => Err(format!("Unsupported engine command: {name}")),
+    }
+}
+
+#[tauri::command]
+fn send_engine_command(state: State<EngineProcess>, command: Value) -> Result<(), String> {
+    validate_command(&command)?;
+    let mut child_slot = state.child.lock().map_err(|_| "Engine lock poisoned")?;
+    let child = child_slot
+        .as_mut()
+        .ok_or("Engine is not running; start it before sending canvas controls.")?;
+    if let Some(exit) = child.try_wait().map_err(|error| error.to_string())? {
+        *child_slot = None;
+        return Err(format!(
+            "Engine is not running; process exited with {exit}."
+        ));
+    }
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or("Engine command channel is unavailable.")?;
+    serde_json::to_writer(&mut *stdin, &command).map_err(|error| error.to_string())?;
+    stdin.write_all(b"\n").map_err(|error| error.to_string())?;
+    stdin.flush().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -371,6 +442,7 @@ fn stop_engine(state: State<EngineProcess>) -> Result<(), String> {
     snapshot.running = false;
     snapshot.pid = None;
     snapshot.hands_detected = 0;
+    snapshot.camera_open = false;
     if snapshot.virtual_camera_status == "active" {
         snapshot.virtual_camera_status = "stopped".to_string();
     }
@@ -387,6 +459,7 @@ fn engine_status(state: State<EngineProcess>) -> Result<EngineStatus, String> {
             let mut snapshot = state.status.lock().map_err(|_| "Status lock poisoned")?;
             snapshot.running = false;
             snapshot.pid = None;
+            snapshot.camera_open = false;
             append_log(&mut snapshot, format!("Engine process exited with {exit}"));
         }
     }
@@ -404,6 +477,7 @@ fn main() {
             start_engine,
             stop_engine,
             engine_status,
+            send_engine_command,
             resolve_python_path,
             run_engine_doctor,
             list_cameras
@@ -472,5 +546,19 @@ mod tests {
         )
         .unwrap_err()
         .contains("Configured Python"));
+    }
+
+    #[test]
+    fn engine_commands_are_strictly_bounded() {
+        assert!(validate_command(&serde_json::json!({"command": "clear_canvas"})).is_ok());
+        assert!(validate_command(
+            &serde_json::json!({"command": "set_drawing_enabled", "enabled": false})
+        )
+        .is_ok());
+        assert!(validate_command(
+            &serde_json::json!({"command": "set_brush_size", "brush_size": 101})
+        )
+        .is_err());
+        assert!(validate_command(&serde_json::json!({"command": "launch_missiles"})).is_err());
     }
 }
