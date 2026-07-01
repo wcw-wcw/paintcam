@@ -8,7 +8,9 @@ from paintcam.app import (
     palette_index,
     pixel_distance,
     probe_camera_indexes,
+    probe_virtual_camera,
     validate_engine_command,
+    virtual_camera_backend,
 )
 
 
@@ -71,6 +73,41 @@ class HelperTests(unittest.TestCase):
 
     def test_pixel_deadzone_distance(self):
         self.assertEqual(pixel_distance((1, 1), (4, 5)), 5.0)
+
+    def test_virtual_camera_probe_does_not_require_a_real_backend(self):
+        cameras = []
+
+        class FakeCamera:
+            backend = "test-backend"
+
+            def __init__(self, width, height, fps):
+                self.size = (width, height, fps)
+                self.closed = False
+                cameras.append(self)
+
+            def close(self):
+                self.closed = True
+
+        class FakeModule:
+            Camera = FakeCamera
+
+        result = probe_virtual_camera(FakeModule(), width=320, height=240, fps=15)
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["backend"], "test-backend")
+        self.assertTrue(result["created"])
+        self.assertTrue(cameras[0].closed)
+
+    def test_virtual_camera_probe_reports_missing_import(self):
+        result = probe_virtual_camera(None)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertFalse(result["importable"])
+        self.assertIn("not installed", result["last_error"])
+
+    def test_virtual_camera_backend_normalizes_name(self):
+        self.assertEqual(
+            virtual_camera_backend(type("Camera", (), {"backend": "obs"})()), "obs"
+        )
+        self.assertIsNone(virtual_camera_backend(object()))
 
 
 if __name__ == "__main__":

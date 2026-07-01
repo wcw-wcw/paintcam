@@ -36,6 +36,13 @@ struct EngineStatus {
     drawing_enabled: bool,
     canvas_dirty: bool,
     virtual_camera_status: String,
+    virtual_camera_backend: Option<String>,
+    virtual_camera_width: Option<u64>,
+    virtual_camera_height: Option<u64>,
+    virtual_camera_fps: f64,
+    virtual_camera_frame_count: u64,
+    virtual_camera_last_write_time: Option<f64>,
+    virtual_camera_write_failure_count: u64,
     last_error: Option<String>,
     recent_log_lines: Vec<String>,
 }
@@ -177,6 +184,40 @@ fn update_from_event(status: &mut EngineStatus, value: &Value, raw: &str) {
     if let Some(dirty) = value.get("canvas_dirty").and_then(Value::as_bool) {
         status.canvas_dirty = dirty;
     }
+    if value
+        .get("event")
+        .and_then(Value::as_str)
+        .is_some_and(|event| matches!(event, "virtual_camera_status" | "virtual_camera_frame"))
+    {
+        if let Some(backend) = value.get("backend").and_then(Value::as_str) {
+            status.virtual_camera_backend = Some(backend.to_string());
+        }
+        if let Some(width) = value.get("width").and_then(Value::as_u64) {
+            status.virtual_camera_width = Some(width);
+        }
+        if let Some(height) = value.get("height").and_then(Value::as_u64) {
+            status.virtual_camera_height = Some(height);
+        }
+        if let Some(fps) = value
+            .get("output_fps")
+            .or_else(|| value.get("fps"))
+            .and_then(Value::as_f64)
+        {
+            status.virtual_camera_fps = fps;
+        }
+        if let Some(count) = value
+            .get("virtual_camera_frame_count")
+            .and_then(Value::as_u64)
+        {
+            status.virtual_camera_frame_count = count;
+        }
+        if let Some(timestamp) = value.get("last_write_time").and_then(Value::as_f64) {
+            status.virtual_camera_last_write_time = Some(timestamp);
+        }
+        if let Some(count) = value.get("write_failure_count").and_then(Value::as_u64) {
+            status.virtual_camera_write_failure_count = count;
+        }
+    }
     if let Some(error) = value
         .get("last_error")
         .or_else(|| value.get("message"))
@@ -236,6 +277,7 @@ fn start_engine(
     virtual_camera_enabled: bool,
     draw_landmarks: bool,
     debug_overlay: bool,
+    virtual_camera_overlays: bool,
     brush_size: u64,
 ) -> Result<(), String> {
     let mut child_slot = state.child.lock().map_err(|_| "Engine lock poisoned")?;
@@ -285,6 +327,9 @@ fn start_engine(
     if debug_overlay {
         command.arg("--debug-overlay");
     }
+    if virtual_camera_overlays {
+        command.arg("--virtual-camera-overlays");
+    }
     command.arg("--brush-size").arg(brush_size.to_string());
     let mut child = command
         .spawn()
@@ -312,7 +357,7 @@ fn start_engine(
             zoom: 1.0,
             drawing_enabled: true,
             virtual_camera_status: if virtual_camera_enabled {
-                "starting"
+                "initializing"
             } else {
                 "disabled"
             }
@@ -385,6 +430,11 @@ fn list_cameras(python_path: Option<String>) -> Result<Value, String> {
     run_engine_utility(python_path.as_deref(), "--list-cameras")
 }
 
+#[tauri::command]
+fn probe_virtual_camera(python_path: Option<String>) -> Result<Value, String> {
+    run_engine_utility(python_path.as_deref(), "--virtual-camera-probe")
+}
+
 fn run_engine_utility(python_path: Option<&str>, argument: &str) -> Result<Value, String> {
     let python = resolve_python(python_path)?;
     let script = project_root()?.join("engine/paintcam_engine.py");
@@ -404,12 +454,13 @@ fn run_engine_utility(python_path: Option<&str>, argument: &str) -> Result<Value
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|value| {
-            value.get("event").and_then(Value::as_str)
-                == Some(if argument == "--doctor" {
-                    "doctor"
-                } else {
-                    "camera_probe"
-                })
+            let expected = match argument {
+                "--doctor" => "doctor",
+                "--list-cameras" => "camera_probe",
+                "--virtual-camera-probe" => "virtual_camera_probe",
+                _ => return false,
+            };
+            value.get("event").and_then(Value::as_str) == Some(expected)
         });
     event.ok_or_else(|| {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -444,7 +495,7 @@ fn stop_engine(state: State<EngineProcess>) -> Result<(), String> {
     snapshot.hands_detected = 0;
     snapshot.camera_open = false;
     if snapshot.virtual_camera_status == "active" {
-        snapshot.virtual_camera_status = "stopped".to_string();
+        snapshot.virtual_camera_status = "disabled".to_string();
     }
     append_log(&mut snapshot, "Engine stopped by user".to_string());
     Ok(())
@@ -480,7 +531,8 @@ fn main() {
             send_engine_command,
             resolve_python_path,
             run_engine_doctor,
-            list_cameras
+            list_cameras,
+            probe_virtual_camera
         ])
         .run(tauri::generate_context!())
         .expect("error while running PaintCam");
@@ -560,5 +612,47 @@ mod tests {
         )
         .is_err());
         assert!(validate_command(&serde_json::json!({"command": "launch_missiles"})).is_err());
+    }
+
+    #[test]
+    fn virtual_camera_events_update_output_metrics() {
+        let mut status = EngineStatus::default();
+        let event = serde_json::json!({
+            "event": "virtual_camera_frame",
+            "status": "active",
+            "backend": "test",
+            "width": 640,
+            "height": 480,
+            "output_fps": 19.5,
+            "virtual_camera_frame_count": 42,
+            "last_write_time": 123.0,
+            "write_failure_count": 1
+        });
+        update_from_event(&mut status, &event, &event.to_string());
+        assert_eq!(status.virtual_camera_backend.as_deref(), Some("test"));
+        assert_eq!(status.virtual_camera_width, Some(640));
+        assert_eq!(status.virtual_camera_height, Some(480));
+        assert_eq!(status.virtual_camera_fps, 19.5);
+        assert_eq!(status.virtual_camera_frame_count, 42);
+        assert_eq!(status.virtual_camera_write_failure_count, 1);
+    }
+
+    #[test]
+    fn virtual_camera_lifecycle_preserves_failure_details() {
+        let mut status = EngineStatus::default();
+        for (state, error) in [
+            ("initializing", None),
+            ("active", None),
+            ("failed", Some("write failed")),
+        ] {
+            let event = serde_json::json!({
+                "event": "virtual_camera_status",
+                "status": state,
+                "last_error": error
+            });
+            update_from_event(&mut status, &event, &event.to_string());
+            assert_eq!(status.virtual_camera_status, state);
+        }
+        assert_eq!(status.last_error.as_deref(), Some("write failed"));
     }
 }

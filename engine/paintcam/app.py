@@ -70,6 +70,18 @@ def load_dependencies() -> dict[str, bool]:
     return status
 
 
+def load_virtual_camera_dependency() -> bool:
+    global pyvirtualcam
+    try:
+        pyvirtualcam = importlib.import_module("pyvirtualcam")
+        available = True
+    except (ImportError, OSError):
+        pyvirtualcam = None
+        available = False
+    emit("dependency_status", dependencies={"pyvirtualcam": available})
+    return available
+
+
 @dataclass
 class EngineConfig:
     camera_index: int = 0
@@ -80,10 +92,12 @@ class EngineConfig:
     virtual_camera: bool = True
     draw_landmarks: bool = False
     debug_overlay: bool = False
+    virtual_camera_overlays: bool = False
     gesture_config_path: str | None = None
     hand_model_path: Path = DEFAULT_HAND_MODEL_PATH
     doctor: bool = False
     list_cameras: bool = False
+    virtual_camera_probe: bool = False
     tuning: GestureTuning = field(default_factory=GestureTuning)
     palette: list[Color] = field(
         default_factory=lambda: [
@@ -279,25 +293,41 @@ class PaintCamEngine:
                         self.zoom,
                         self.drawing_enabled,
                     )
-                    if self.config.draw_landmarks:
-                        draw_hand_landmarks(output, hands)
-                    if self.config.debug_overlay:
-                        draw_debug_overlay(
-                            output,
-                            result,
-                            self.palette,
-                            self.drawing,
-                            self.zoom,
-                            len(hands),
-                            virtual_active,
-                            conflicts,
-                            self.drawing_enabled,
-                            self.canvas_dirty,
+                    virtual_output = output
+                    preview_output = output.copy() if (
+                        self.config.preview
+                        and (self.config.draw_landmarks or self.config.debug_overlay)
+                        and not self.config.virtual_camera_overlays
+                    ) else output
+                    overlay_targets = [preview_output] if self.config.preview else []
+                    if (
+                        self.config.virtual_camera_overlays
+                        and not any(
+                            target is virtual_output for target in overlay_targets
                         )
+                    ):
+                        overlay_targets.append(virtual_output)
+                    if self.config.draw_landmarks:
+                        for target in overlay_targets:
+                            draw_hand_landmarks(target, hands)
+                    if self.config.debug_overlay:
+                        for target in overlay_targets:
+                            draw_debug_overlay(
+                                target,
+                                result,
+                                self.palette,
+                                self.drawing,
+                                self.zoom,
+                                len(hands),
+                                virtual_active,
+                                conflicts,
+                                self.drawing_enabled,
+                                self.canvas_dirty,
+                            )
                     if virtual_camera is not None:
-                        virtual_camera.send(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
-                        virtual_camera.sleep_until_next_frame()
-
+                        if not write_virtual_camera_frame(virtual_camera, virtual_output):
+                            virtual_camera = None
+                            virtual_active = False
                     gesture_state = (
                         result.gesture_name,
                         result.active,
@@ -326,8 +356,8 @@ class PaintCamEngine:
                         emit(
                             "camera_frame",
                             camera_index=self.config.camera_index,
-                            width=output.shape[1],
-                            height=output.shape[0],
+                            width=virtual_output.shape[1],
+                            height=virtual_output.shape[0],
                             fps=self.config.fps,
                             measured_fps=round(measured_fps, 1),
                             frame_index=frame_index,
@@ -348,7 +378,7 @@ class PaintCamEngine:
                         )
                         last_frame_event = now
                     if self.config.preview:
-                        cv2.imshow("PaintCam Output", output)
+                        cv2.imshow("PaintCam Output", preview_output)
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
         finally:
@@ -422,30 +452,148 @@ def start_command_reader() -> queue.SimpleQueue[dict[str, Any]]:
 
 @contextmanager
 def virtual_camera_sink(config: EngineConfig, frame: Any):
+    height, width = frame.shape[:2]
+    details = {
+        "width": width,
+        "height": height,
+        "fps": config.fps,
+        "backend_requested": "auto",
+    }
     if not config.virtual_camera:
-        emit("virtual_camera_status", status="disabled", virtual_camera_enabled=False)
+        emit(
+            "virtual_camera_status",
+            status="disabled",
+            virtual_camera_enabled=False,
+            backend=None,
+            **details,
+        )
         yield None
         return
-    try:
-        height, width = frame.shape[:2]
-        camera = pyvirtualcam.Camera(width=width, height=height, fps=config.fps)
-    except Exception as error:
-        message = f"Virtual camera unavailable: {error}. Retry with --no-virtual-camera."
+    emit(
+        "virtual_camera_status",
+        status="initializing",
+        virtual_camera_enabled=True,
+        backend=None,
+        **details,
+    )
+    if pyvirtualcam is None:
+        message = "pyvirtualcam is not installed."
         emit(
             "virtual_camera_status",
             status="unavailable",
             virtual_camera_enabled=False,
+            backend=None,
             last_error=message,
+            **details,
+        )
+        yield None
+        return
+    try:
+        camera = pyvirtualcam.Camera(width=width, height=height, fps=config.fps)
+    except Exception as error:
+        message = f"Virtual camera unavailable: {error}"
+        emit(
+            "virtual_camera_status",
+            status="unavailable",
+            virtual_camera_enabled=False,
+            backend=None,
+            last_error=message,
+            **details,
         )
         print(message, file=sys.stderr)
         yield None
         return
-    emit("virtual_camera_status", status="active", virtual_camera_enabled=True)
+    backend = virtual_camera_backend(camera)
+    global _virtual_camera_metrics
+    _virtual_camera_metrics = VirtualCameraMetrics()
+    emit(
+        "virtual_camera_status",
+        status="active",
+        virtual_camera_enabled=True,
+        backend=backend,
+        **details,
+    )
     try:
         with camera:
             yield camera
     finally:
-        emit("virtual_camera_status", status="stopped", virtual_camera_enabled=False)
+        emit(
+            "virtual_camera_status",
+            status="disabled",
+            virtual_camera_enabled=False,
+            backend=backend,
+            **details,
+        )
+
+
+@dataclass
+class VirtualCameraMetrics:
+    frame_count: int = 0
+    write_failure_count: int = 0
+    window_started: float = field(default_factory=time.monotonic)
+    window_frames: int = 0
+    output_fps: float = 0.0
+    last_event_time: float = 0.0
+
+
+_virtual_camera_metrics = VirtualCameraMetrics()
+
+
+def virtual_camera_backend(camera: Any) -> str | None:
+    backend = getattr(camera, "backend", None)
+    return str(backend) if backend else None
+
+
+def virtual_camera_frame_size(frame: Any, width: int, height: int) -> Any:
+    return resize_frame(frame, width, height)
+
+
+def write_virtual_camera_frame(camera: Any, frame: Any) -> bool:
+    metrics = _virtual_camera_metrics
+    now = time.monotonic()
+    try:
+        output = virtual_camera_frame_size(frame, camera.width, camera.height)
+        camera.send(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
+        camera.sleep_until_next_frame()
+        metrics.frame_count += 1
+        metrics.window_frames += 1
+        elapsed = now - metrics.window_started
+        if elapsed >= 1.0:
+            metrics.output_fps = metrics.window_frames / elapsed
+            metrics.window_frames = 0
+            metrics.window_started = now
+        if now - metrics.last_event_time >= 1.0:
+            emit(
+                "virtual_camera_frame",
+                status="active",
+                backend=virtual_camera_backend(camera),
+                width=camera.width,
+                height=camera.height,
+                fps=camera.fps,
+                virtual_camera_frame_count=metrics.frame_count,
+                last_write_time=time.time(),
+                output_fps=round(metrics.output_fps, 1),
+                write_failure_count=metrics.write_failure_count,
+            )
+            metrics.last_event_time = now
+        return True
+    except Exception as error:
+        metrics.write_failure_count += 1
+        message = f"Virtual camera frame write failed: {error}"
+        emit(
+            "virtual_camera_status",
+            status="failed",
+            virtual_camera_enabled=False,
+            backend=virtual_camera_backend(camera),
+            width=getattr(camera, "width", None),
+            height=getattr(camera, "height", None),
+            fps=getattr(camera, "fps", None),
+            virtual_camera_frame_count=metrics.frame_count,
+            write_failure_count=metrics.write_failure_count,
+            last_error=message,
+        )
+        print(message, file=sys.stderr)
+        return False
 
 
 def compose_output(
@@ -623,10 +771,20 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
     parser.add_argument("--no-virtual-camera", action="store_true")
     parser.add_argument("--draw-landmarks", action="store_true")
     parser.add_argument("--debug-overlay", action="store_true")
+    parser.add_argument(
+        "--virtual-camera-overlays",
+        action="store_true",
+        help="Include landmark and debug diagnostics in virtual-camera output.",
+    )
     parser.add_argument("--brush-size", type=int)
     parser.add_argument("--gesture-config")
     parser.add_argument("--hand-model")
     parser.add_argument("--doctor", action="store_true")
+    parser.add_argument(
+        "--virtual-camera-probe",
+        action="store_true",
+        help="Try creating a test virtual camera and emit a structured result.",
+    )
     parser.add_argument(
         "--list-cameras",
         action="store_true",
@@ -650,10 +808,12 @@ def parse_args(argv: list[str] | None = None) -> EngineConfig:
         virtual_camera=not args.no_virtual_camera,
         draw_landmarks=args.draw_landmarks,
         debug_overlay=args.debug_overlay,
+        virtual_camera_overlays=args.virtual_camera_overlays,
         gesture_config_path=args.gesture_config,
         hand_model_path=resolve_hand_model_path(args.hand_model),
         doctor=args.doctor,
         list_cameras=args.list_cameras,
+        virtual_camera_probe=args.virtual_camera_probe,
         tuning=tuning,
     )
 
@@ -708,6 +868,52 @@ def emit_camera_probe(dependencies: dict[str, bool]) -> int:
     return 0
 
 
+def probe_virtual_camera(
+    module: Any, width: int = 640, height: int = 480, fps: int = 20
+) -> dict[str, Any]:
+    result = {
+        "importable": module is not None,
+        "created": False,
+        "backend": None,
+        "backend_requested": "auto",
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "status": "unavailable",
+        "last_error": None,
+    }
+    if module is None:
+        result["last_error"] = "pyvirtualcam is not installed."
+        return result
+    camera = None
+    try:
+        camera = module.Camera(width=width, height=height, fps=fps)
+        result.update(
+            created=True,
+            backend=virtual_camera_backend(camera),
+            status="active",
+        )
+    except Exception as error:
+        result["last_error"] = str(error)
+    finally:
+        if camera is not None:
+            close = getattr(camera, "close", None)
+            if close:
+                close()
+    return result
+
+
+def emit_virtual_camera_probe(dependencies: dict[str, bool]) -> int:
+    result = probe_virtual_camera(pyvirtualcam if dependencies["pyvirtualcam"] else None)
+    emit(
+        "virtual_camera_probe",
+        python_executable=sys.executable,
+        pyvirtualcam_version=getattr(pyvirtualcam, "__version__", None),
+        **result,
+    )
+    return 0
+
+
 def main() -> int:
     try:
         config = parse_args()
@@ -717,6 +923,10 @@ def main() -> int:
         print(message, file=sys.stderr)
         emit("engine_stopped", reason="configuration_error")
         return 2
+    if config.virtual_camera_probe:
+        return emit_virtual_camera_probe(
+            {"pyvirtualcam": load_virtual_camera_dependency()}
+        )
     dependencies = load_dependencies()
     if config.doctor:
         emit_doctor(dependencies)
@@ -751,20 +961,6 @@ def main() -> int:
         print(error["message"], file=sys.stderr)
         emit("engine_stopped", reason="model_error")
         return 2
-    if config.virtual_camera and not dependencies["pyvirtualcam"]:
-        message = (
-            "pyvirtualcam is not installed, so virtual camera output is unavailable. "
-            "Install requirements or retry with --no-virtual-camera."
-        )
-        emit(
-            "error",
-            code="virtual_camera_dependency_missing",
-            message=message,
-            last_error=message,
-        )
-        print(message, file=sys.stderr)
-        emit("engine_stopped", reason="dependency_error")
-        return 2
     emit(
         "engine_started",
         camera_index=config.camera_index,
@@ -775,6 +971,7 @@ def main() -> int:
         virtual_camera_enabled=config.virtual_camera,
         draw_landmarks=config.draw_landmarks,
         debug_overlay=config.debug_overlay,
+        virtual_camera_overlays=config.virtual_camera_overlays,
         gesture_config=config.gesture_config_path,
         hand_model=str(config.hand_model_path),
         gesture_tuning=config.tuning.to_dict(),

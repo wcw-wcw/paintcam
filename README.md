@@ -106,6 +106,7 @@ python3 engine/paintcam_engine.py \
   --debug-overlay --no-virtual-camera
 python3 engine/paintcam_engine.py --help
 python3 engine/paintcam_engine.py --list-cameras
+python3 engine/paintcam_engine.py --virtual-camera-probe
 ```
 
 `--list-cameras` probes indexes 0–4 and reports which devices open and return a
@@ -115,6 +116,9 @@ require the `.task` model. The same probe is available in the Tauri UI.
 The debug overlay shows the winning gesture, confidence, selected color, brush
 size, zoom, hand count, virtual-camera state, and any cooldown/conflict state.
 Landmarks can be enabled at the same time when tuning detection geometry.
+These diagnostic overlays appear in the local preview only by default. Pass
+`--virtual-camera-overlays` (or enable **Include diagnostics in virtual
+output**) to send them to the virtual camera too.
 
 Press `q` in the preview window to stop. Stdout is reserved for one JSON object
 per line. Events include engine/dependency lifecycle, camera frames, gesture
@@ -177,6 +181,60 @@ While the engine is running, **Clear canvas**, **Reset zoom**, **Pause/Resume
 drawing**, and brush size changes are sent over a bounded JSONL stdin command
 channel. Preview and hand tracking continue while drawing is paused. Gesture
 threshold changes in a config file require an engine restart.
+
+## Virtual camera testing
+
+PaintCam sends a mirrored, resized camera frame composited with the persistent
+drawing canvas, palette, and PaintCam drawing status. Landmark and debug
+diagnostics are preview-only unless explicitly included with
+`--virtual-camera-overlays`. The frame passed to pyvirtualcam is always resized
+to the virtual camera's declared width and height.
+
+Probe support without opening the physical camera or loading MediaPipe:
+
+```sh
+python3 engine/paintcam_engine.py --virtual-camera-probe
+```
+
+The probe exits after emitting JSONL describing whether pyvirtualcam imported,
+whether a test camera was created, the selected backend when reported by
+pyvirtualcam, output dimensions/FPS, and any error. The same check is available
+through **Probe virtual camera** in the control panel.
+
+OBS-first workflow:
+
+1. Run the probe and confirm `created` is `true`.
+2. Start PaintCam with preview and virtual camera enabled.
+3. Confirm the UI reports **active**, a backend, output size, advancing virtual
+   frame count, and a recent write time.
+4. In OBS, add a Video Capture Device source and select the virtual camera
+   exposed by the installed backend.
+5. Compare OBS with preview for mirroring, drawing, palette, output dimensions,
+   and steady FPS. Diagnostic overlays should appear only where configured.
+6. Only after OBS works, test the camera selector in Zoom, Discord, or another
+   consumer. Restart that app if it was open before the backend became
+   available.
+
+Common failures:
+
+- **pyvirtualcam missing:** install the project requirements in the Python
+  executable shown by PaintCam, then rerun the probe.
+- **No compatible backend:** install or start a backend supported by
+  pyvirtualcam on the current platform. Backend names and setup vary, so use
+  the probe error and the backend's own documentation.
+- **Consumer does not show the camera:** prove the feed in OBS first, then
+  restart the consumer and recheck its camera permissions and device list.
+- **Camera already in use:** close other camera producers/consumers and retry
+  both the physical-camera and virtual-camera probes.
+- **Low FPS:** compare capture FPS and virtual output FPS, close competing
+  video apps, disable preview diagnostics, and test a lower width, height, or
+  requested FPS from the CLI.
+
+Virtual-camera lifecycle events use `disabled`, `initializing`, `active`,
+`unavailable`, and `failed`. Once active, throttled events report backend,
+size, requested/output FPS, frame count, last successful write time, and write
+failure count. A backend creation or write failure does not prevent the local
+preview from continuing.
 
 ## First successful camera test
 

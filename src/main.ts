@@ -21,6 +21,13 @@ type EngineStatus = {
   drawingEnabled: boolean;
   canvasDirty: boolean;
   virtualCameraStatus: string;
+  virtualCameraBackend: string | null;
+  virtualCameraWidth: number | null;
+  virtualCameraHeight: number | null;
+  virtualCameraFps: number;
+  virtualCameraFrameCount: number;
+  virtualCameraLastWriteTime: number | null;
+  virtualCameraWriteFailureCount: number;
   lastError: string | null;
   recentLogLines: string[];
 };
@@ -42,12 +49,14 @@ app.innerHTML = `
       <label class="check"><input id="virtual-camera" type="checkbox" checked> Virtual camera enabled</label>
       <label class="check"><input id="draw-landmarks" type="checkbox"> Draw landmarks</label>
       <label class="check"><input id="debug-overlay" type="checkbox"> Debug overlay</label>
+      <label class="check"><input id="virtual-camera-overlays" type="checkbox"> Include diagnostics in virtual output</label>
       <label>Brush size (px)<input id="brush-size" type="number" min="1" max="100" step="1" value="16"></label>
       <div class="actions">
         <button id="start" class="primary" type="button">Start engine</button>
         <button id="stop" type="button">Stop</button>
         <button id="doctor" type="button">Run doctor</button>
         <button id="probe-cameras" type="button">Probe cameras 0–4</button>
+        <button id="probe-virtual-camera" type="button">Probe virtual camera</button>
       </div>
     </section>
 
@@ -80,9 +89,24 @@ app.innerHTML = `
         <div><dt>Drawing</dt><dd id="drawing-state">Enabled</dd></div>
         <div><dt>Canvas</dt><dd id="canvas-state">Empty</dd></div>
         <div><dt>Virtual camera</dt><dd id="virtual-status">—</dd></div>
+        <div><dt>Virtual backend</dt><dd id="virtual-backend">—</dd></div>
+        <div><dt>Virtual output</dt><dd id="virtual-output">—</dd></div>
+        <div><dt>Virtual frames</dt><dd id="virtual-frames">0</dd></div>
+        <div><dt>Last virtual write</dt><dd id="virtual-last-write">—</dd></div>
+        <div><dt>Write failures</dt><dd id="virtual-failures">0</dd></div>
       </dl>
       <div id="conflict-wrap" class="notice" hidden><strong>Gesture conflict/cooldown</strong><span id="conflicts"></span></div>
       <div id="error-wrap" class="error" hidden><strong>Last error</strong><span id="error"></span></div>
+    </section>
+
+    <section class="panel">
+      <h2>OBS-first virtual camera check</h2>
+      <ol class="checklist">
+        <li>Run <strong>Probe virtual camera</strong> and confirm it creates a backend.</li>
+        <li>Start PaintCam with preview and virtual camera enabled.</li>
+        <li>In OBS, add a Video Capture Device and select the PaintCam virtual camera.</li>
+        <li>Confirm motion, mirroring, drawing, output size, and stable FPS before trying meeting apps.</li>
+      </ol>
     </section>
 
     <section class="panel diagnostics-panel">
@@ -144,6 +168,15 @@ function setStatus(status: EngineStatus) {
   text("canvas-state", status.canvasDirty ? "Contains drawing" : "Empty");
   text("toggle-drawing", status.drawingEnabled ? "Pause drawing" : "Resume drawing");
   text("virtual-status", status.virtualCameraStatus || "—");
+  text("virtual-backend", status.virtualCameraBackend || "—");
+  text("virtual-output", status.virtualCameraWidth && status.virtualCameraHeight
+    ? `${status.virtualCameraWidth}×${status.virtualCameraHeight} @ ${status.virtualCameraFps.toFixed(1)} FPS`
+    : "—");
+  text("virtual-frames", String(status.virtualCameraFrameCount));
+  text("virtual-last-write", status.virtualCameraLastWriteTime
+    ? new Date(status.virtualCameraLastWriteTime * 1000).toLocaleTimeString()
+    : "—");
+  text("virtual-failures", String(status.virtualCameraWriteFailureCount));
   const chip = byId<HTMLElement>("color-chip");
   if (chip) chip.style.backgroundColor = status.selectedColor || "transparent";
   const errorWrap = byId<HTMLElement>("error-wrap");
@@ -177,6 +210,7 @@ startButton?.addEventListener("click", async () => {
       virtualCameraEnabled: byId<HTMLInputElement>("virtual-camera")?.checked ?? true,
       drawLandmarks: byId<HTMLInputElement>("draw-landmarks")?.checked ?? false,
       debugOverlay: byId<HTMLInputElement>("debug-overlay")?.checked ?? false,
+      virtualCameraOverlays: byId<HTMLInputElement>("virtual-camera-overlays")?.checked ?? false,
       brushSize: Number(byId<HTMLInputElement>("brush-size")?.value ?? 16),
     });
     await refreshStatus();
@@ -223,7 +257,7 @@ byId<HTMLInputElement>("brush-size")?.addEventListener("input", (event) => {
   }, 150);
 });
 
-async function runDiagnostic(command: "run_engine_doctor" | "list_cameras") {
+async function runDiagnostic(command: "run_engine_doctor" | "list_cameras" | "probe_virtual_camera") {
   const output = byId<HTMLPreElement>("diagnostics");
   if (output) output.textContent = "Running…";
   try {
@@ -233,6 +267,15 @@ async function runDiagnostic(command: "run_engine_doctor" | "list_cameras") {
     if (output) output.textContent = JSON.stringify(result, null, 2);
     if (typeof result.python_executable === "string") {
       text("python", result.python_executable);
+    }
+    if (command === "probe_virtual_camera") {
+      const checkbox = byId<HTMLInputElement>("virtual-camera");
+      if (checkbox && result.created === false) {
+        checkbox.checked = false;
+        checkbox.disabled = result.importable === false;
+      } else if (checkbox) {
+        checkbox.disabled = false;
+      }
     }
   } catch (error) {
     if (output) output.textContent = String(error);
@@ -245,6 +288,10 @@ byId<HTMLButtonElement>("doctor")?.addEventListener("click", () => {
 
 byId<HTMLButtonElement>("probe-cameras")?.addEventListener("click", () => {
   void runDiagnostic("list_cameras");
+});
+
+byId<HTMLButtonElement>("probe-virtual-camera")?.addEventListener("click", () => {
+  void runDiagnostic("probe_virtual_camera");
 });
 
 stopButton?.addEventListener("click", async () => {
